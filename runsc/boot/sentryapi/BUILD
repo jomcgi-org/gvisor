@@ -23,6 +23,7 @@ go_library(
         "restore.go",
         "seccheck.go",
         "sentryapi.go",
+        "template.go",
         "usage.go",
         "vfs.go",
     ],

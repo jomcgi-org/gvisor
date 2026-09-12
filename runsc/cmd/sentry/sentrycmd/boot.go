@@ -253,6 +253,17 @@ type Boot struct {
 
 	// noRootContainer boots without a root container. See Create.noRootContainer.
 	noRootContainer bool
+	// templateSandbox is true when this boot is for a template sandbox: the
+	// sandbox will boot the kernel + root container, pause, and wait on
+	// the donated template socket for SandboxTemplate.Fork RPCs.
+	templateSandbox bool
+	templateWorkers int
+	templateReadyFD int
+
+	// templateServerFD is the donated Unix socket fd on
+	// which the template sandbox listens for fork requests. Required when
+	// templateSandbox is true; ignored otherwise.
+	templateServerFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -322,6 +333,10 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Var(&b.fsRestoreFDs, "fs-restore-fds", "ordered list of file descriptors for filesystem checkpoint restore")
 	f.BoolVar(&b.fsRestoreCheckpointGofer, "fs-restore-checkpoint-gofer", false, "if true, -fs-restore-fds is a socket connected to checkpoint gofer")
 	f.IntVar(&b.rootfsUpperTarFD, "rootfs-upper-tar-fd", -1, "file descriptor to the tar file containing the rootfs upper layer changes.")
+	f.BoolVar(&b.templateSandbox, "template-sandbox", false, "set true to boot a template sandbox (internal flag).")
+	f.IntVar(&b.templateWorkers, "template-workers", 1, "number of workers forked from the template seed (internal flag).")
+	f.IntVar(&b.templateReadyFD, "template-ready-fd", -1, "template readiness notification FD (internal flag).")
+	f.IntVar(&b.templateServerFD, "template-server-fd", -1, "required FD of a stream socket for the sandbox template server that must be donated to this process when --template-sandbox is true.")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
@@ -489,7 +504,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		timer.Reached("chroot set up")
 		argOverride["setup-root"] = "false"
 
-		if !conf.Rootless {
+		if !conf.Rootless && !b.templateSandbox {
 			// /proc is umounted from a forked process, because the
 			// current one is going to drop capabilities and won't be
 			// able to umount it.
@@ -750,6 +765,10 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		RootfsUpperTarFD:         b.rootfsUpperTarFD,
 		NoRootContainer:          b.noRootContainer,
 		StartupTimer:             timer,
+		TemplateSandbox:          b.templateSandbox,
+		TemplateWorkers:          b.templateWorkers,
+		TemplateReadyFD:          b.templateReadyFD,
+		TemplateServerFD:         b.templateServerFD,
 	}
 	timer.Reached("creating loader")
 	l, err := boot.New(bootArgs)
