@@ -40,6 +40,7 @@ go_library(
         "//pkg/bpf",
         "//pkg/context",
         "//pkg/cpuid",
+        "//pkg/fd",
         "//pkg/hostarch",
         "//pkg/hosttid",
         "//pkg/log",

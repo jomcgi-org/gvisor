@@ -50,6 +50,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/hostmm"
@@ -286,6 +287,16 @@ func (*PTrace) MapUnit() uint64 {
 	// The host kernel manages page tables and arbitrary-sized mappings
 	// have effectively the same cost.
 	return 0
+}
+
+// Drop implements platform.Platform.Drop.
+func (*PTrace) Drop() {
+	panic("ptrace platform does not support Drop/Reload")
+}
+
+// Reload implements platform.Platform.Reload.
+func (*PTrace) Reload(_ *fd.FD) error {
+	panic("ptrace platform does not support Drop/Reload")
 }
 
 // MaxUserAddress returns the first address that may not be used by user

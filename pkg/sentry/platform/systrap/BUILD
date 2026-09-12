@@ -88,6 +88,7 @@ go_library(
         "//pkg/bpf",
         "//pkg/context",
         "//pkg/cpuid",
+        "//pkg/fd",
         "//pkg/gomaxprocs",
         "//pkg/hostarch",
         "//pkg/hostsyscall",

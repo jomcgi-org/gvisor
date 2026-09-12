@@ -61,6 +61,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/gomaxprocs"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/memutil"
@@ -371,6 +372,16 @@ func (*Systrap) MapUnit() uint64 {
 	// The host kernel manages page tables and arbitrary-sized mappings
 	// have effectively the same cost.
 	return 0
+}
+
+// Drop implements platform.Platform.Drop.
+func (*Systrap) Drop() {
+	panic("systrap platform does not support Drop/Reload")
+}
+
+// Reload implements platform.Platform.Reload.
+func (*Systrap) Reload(_ *fd.FD) error {
+	panic("systrap platform does not support Drop/Reload")
 }
 
 // MaxUserAddress returns the first address that may not be used by user
