@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mohae/deepcopy"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 
@@ -62,6 +63,74 @@ func validateID(id string) error {
 		return fmt.Errorf("invalid container id: %v", id)
 	}
 	return nil
+}
+
+func createFilestoreForMount(info TemplateBackendFile, childID string) (*os.File, string, error) {
+	var conf specutils.GoferMountConf
+	if err := conf.Set(info.GoferConf); err != nil {
+		return nil, "", fmt.Errorf("parsing template backend gofer conf for %q: %w", info.MountPoint, err)
+	}
+	switch conf.Upper {
+	case specutils.SelfOverlay:
+		filestorePath := sentryapi.SelfFilestorePath(info.MountSrc, childID)
+		fd, err := unix.Open(filestorePath, unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_EXCL, 0666)
+		if err != nil {
+			return nil, "", fmt.Errorf("creating fork filestore %q: %w", filestorePath, err)
+		}
+		return os.NewFile(uintptr(fd), filestorePath), filestorePath, nil
+	case specutils.AnonOverlay:
+		if info.AnonDir == "" {
+			return nil, "", fmt.Errorf("anonymous fork backend for %q missing host directory", info.MountPoint)
+		}
+		file, err := os.CreateTemp(info.AnonDir, "runsc-fork-filestore-")
+		if err != nil {
+			return nil, "", fmt.Errorf("creating fork filestore in %q: %w", info.AnonDir, err)
+		}
+		if err := unix.Unlink(file.Name()); err != nil {
+			_ = file.Close()
+			return nil, "", fmt.Errorf("unlinking fork filestore %q: %w", file.Name(), err)
+		}
+		return file, "", nil
+	default:
+		return nil, "", fmt.Errorf("unexpected fork backend upper layer %s for %q", conf.Upper, info.MountPoint)
+	}
+}
+
+func createForkOverlayBackendFiles(infos []TemplateBackendFile, childID string) ([]sandbox.ForkBackendFile, []string, error) {
+	var backendFiles []sandbox.ForkBackendFile
+	var selfFilestorePaths []string
+	cu := cleanup.Make(func() {
+		for _, backendFile := range backendFiles {
+			_ = backendFile.File.Close()
+		}
+		for _, path := range selfFilestorePaths {
+			_ = os.Remove(path)
+		}
+	})
+	defer cu.Clean()
+
+	for _, info := range infos {
+		file, filestorePath, err := createFilestoreForMount(info, childID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if filestorePath != "" {
+			selfFilestorePaths = append(selfFilestorePaths, filestorePath)
+		}
+		hostmm.IMAWorkAroundForMemFile(file.Fd())
+		backendFiles = append(backendFiles, sandbox.ForkBackendFile{
+			MountPoint: info.MountPoint,
+			File:       file,
+		})
+	}
+	cu.Release()
+	return backendFiles, selfFilestorePaths, nil
+}
+
+func closeForkBackendFiles(files []sandbox.ForkBackendFile) {
+	for _, backendFile := range files {
+		_ = backendFile.File.Close()
+	}
 }
 
 // Container represents a containerized application. When running, the
@@ -146,6 +215,14 @@ type Container struct {
 	// following entries are for bind mounts in Spec.Mounts (in the same order).
 	GoferMountConfs specutils.GoferMountConfFlags `json:"goferMountConfs"`
 
+	// ForkFilestorePaths are self-backed filestore files created specifically
+	// for a forked sandbox. They are removed when the forked container is
+	// destroyed.
+	ForkFilestorePaths []string `json:"forkFilestorePaths,omitempty"`
+
+	// TemplateState is populated only for sandbox templates.
+	TemplateState *TemplateState `json:"templateState,omitempty"`
+
 	//
 	// Fields below this line are not saved in the state file and will not
 	// be preserved across commands.
@@ -197,6 +274,11 @@ type Args struct {
 	// It only applies for the init container.
 	Attached bool
 
+	// Stdin, Stdout and Stderr override the root container stdio when non-nil.
+	Stdin  *os.File
+	Stdout *os.File
+	Stderr *os.File
+
 	// PassFiles are user-supplied files from the host to be exposed to the
 	// sandboxed app. They are supported only for the sandbox's root container.
 	PassFiles map[int]*os.File
@@ -218,6 +300,57 @@ type Args struct {
 	// neither Process nor Root, and no gofer is started. Only valid when ID is
 	// the sandbox ID.
 	NoRootContainer bool
+	// TemplateSandbox is true to create a template sandbox: one that boots,
+	// pauses, and serves SandboxTemplate.Fork on its template socket. See
+	// pkg/sentry/platform/kvm + runsc/boot for the loader-side mechanism.
+	TemplateSandbox   bool
+	TemplateWorkers   int
+	TemplateReadyFile *os.File
+}
+
+// ForkArgs is used to create a new root container by forking a template sandbox.
+//
+// Sandbox fork is experimental. It supports only single-container, goferless
+// EROFS templates on KVM or SlimVM. Templates use netstack with no configured
+// links, and NetworkArgs must be provided explicitly for every child. Exactly
+// the guest must request a checkpoint through /proc/gvisor/checkpoint. The template
+// workload must not create network endpoints before that read because their
+// state would be inherited by every forked child. Terminal stdio and metric
+// server registration are unsupported.
+//
+// The forked sandbox inherits its guest-visible configuration from the template
+// sandbox; these arguments describe the host-side resources, metadata, and
+// spec environment that can be changed for the forked child.
+type ForkArgs struct {
+	// ID is the container/sandbox id for the forked child.
+	ID string
+
+	// Env supplies NAME=VALUE entries through /proc/gvisor/spec_environ.
+	// Nil inherits the template's spec environment; an empty non-nil slice
+	// supplies an empty environment. The application must read and apply the
+	// entries itself; existing process environments are unchanged.
+	Env []string
+
+	// BundleDir is recorded in container state metadata.
+	BundleDir string
+
+	// PIDFile is the filename where the forked sandbox pid will be written.
+	PIDFile string
+
+	// CgroupPath, if non-empty, must name an existing cgroupfs path. Fork moves
+	// the forked sandbox pid into it. If empty, the forked child inherits the
+	// sandbox template process cgroup.
+	CgroupPath string
+
+	// Stdout and Stderr are donated to the forked child as its root stdio.
+	// They must be writable regular files opened with O_APPEND. If nil,
+	// os.Stdout and os.Stderr are used and must satisfy the same constraints.
+	Stdout *os.File
+	Stderr *os.File
+
+	// NetworkArgs configures the forked sandbox netstack. It must be provided;
+	// fork does not profile or configure host network state.
+	NetworkArgs *sentryapi.CreateLinksAndRoutesArgs
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -394,6 +527,136 @@ func New(conf *config.Config, args Args) (*Container, error) {
 	return c, nil
 }
 
+// Fork creates and starts a root container by asking an existing
+// single-container template sandbox to fork a child sandbox. The returned
+// container is saved in Running state. Fork may be called concurrently on the
+// same template; it does not reload persisted template metadata.
+func (t *Template) Fork(conf *config.Config, args ForkArgs) (*Container, error) {
+	if t == nil || !t.Ready || t.process == nil {
+		return nil, fmt.Errorf("sandbox template is not ready")
+	}
+	if conf.RootDir != t.RootDir {
+		return nil, fmt.Errorf("fork root directory %q does not match template %q", conf.RootDir, t.RootDir)
+	}
+	log.Debugf("Fork container, cid: %s, template: %s, rootDir: %q", args.ID, t.ID, conf.RootDir)
+	if err := validateID(args.ID); err != nil {
+		return nil, err
+	}
+	if err := validateID(t.ID); err != nil {
+		return nil, fmt.Errorf("invalid template id: %w", err)
+	}
+	if args.NetworkArgs == nil {
+		return nil, fmt.Errorf("forked sandbox requires explicit network arguments")
+	}
+	if err := validateTemplateForkConfig(conf, "forked sandbox"); err != nil {
+		return nil, err
+	}
+
+	if t.Platform != conf.Platform {
+		return nil, fmt.Errorf("template %q uses platform %q, but fork requested %q", t.ID, t.Platform, conf.Platform)
+	}
+
+	spec := &specs.Spec{
+		Version: specs.Version,
+		Process: deepcopy.Copy(t.process).(*specs.Process),
+		Root:    &specs.Root{},
+		Linux:   &specs.Linux{CgroupsPath: args.CgroupPath},
+	}
+
+	c := &Container{
+		allowWrite: true,
+		ID:         args.ID,
+		Spec:       spec,
+		BundleDir:  args.BundleDir,
+		Status:     Creating,
+		CreatedAt:  time.Now(),
+		Owner:      os.Getenv("USER"),
+		Saver: StateFile{
+			RootDir: conf.RootDir,
+			ID: FullID{
+				SandboxID:   args.ID,
+				ContainerID: args.ID,
+			},
+		},
+	}
+	if err := c.Saver.LockForNew(); err != nil {
+		return nil, fmt.Errorf("cannot lock container metadata file: %w", err)
+	}
+	defer c.Saver.UnlockOrDie()
+	cu := cleanup.Make(func() {
+		if err := c.destroyLocked(); err != nil {
+			log.Warningf("rolling back forked container %q: %v", c.ID, err)
+		}
+		c.Saver.setLoaded(nil)
+	})
+	defer cu.Clean()
+
+	var containerCgroup cgroup.Cgroup
+	if !conf.IgnoreCgroups {
+		if conf.SystemdCgroup {
+			return nil, fmt.Errorf("forked sandbox cgroups require an existing cgroupfs path; --systemd-cgroup is not supported for fork")
+		}
+		if args.CgroupPath != "" {
+			if cgroup.LikelySystemdPath(args.CgroupPath) {
+				return nil, fmt.Errorf("forked sandbox cgroup path %q looks like a systemd path; provide an existing cgroupfs path", args.CgroupPath)
+			}
+			var err error
+			containerCgroup, err = cgroup.NewFromPath(args.CgroupPath, false /* useSystemd */)
+			if err != nil {
+				return nil, fmt.Errorf("loading forked sandbox cgroup path %q: %w", args.CgroupPath, err)
+			}
+		}
+	}
+	backendFiles, selfFilestorePaths, err := createForkOverlayBackendFiles(t.backendFiles, args.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer closeForkBackendFiles(backendFiles)
+	c.ForkFilestorePaths = selfFilestorePaths
+
+	sand := &sandbox.Sandbox{
+		ID:                  args.ID,
+		UID:                 -1,
+		GID:                 -1,
+		CgroupJSON:          cgroup.CgroupJSON{Cgroup: containerCgroup},
+		MetricMetadata:      conf.MetricMetadata(),
+		MetricServerAddress: conf.MetricServer,
+		MountHints:          &sentryapi.PodMountHints{},
+		StartTime:           starttime.Get(),
+	}
+	sand.SetRootDir(conf.RootDir)
+	c.Sandbox = sand
+
+	if err := sand.Fork(conf, sandbox.ForkArgs{
+		Template:     t.seed,
+		Env:          args.Env,
+		Stdout:       args.Stdout,
+		Stderr:       args.Stderr,
+		NetworkArgs:  args.NetworkArgs,
+		BackendFiles: backendFiles,
+		BeforeStart: func() error {
+			c.changeStatus(Created)
+			return c.saveLocked()
+		},
+	}); err != nil {
+		return nil, err
+	}
+
+	c.changeStatus(Running)
+	if err := c.saveLocked(); err != nil {
+		return nil, err
+	}
+
+	if args.PIDFile != "" {
+		if err := os.WriteFile(args.PIDFile, []byte(strconv.Itoa(c.SandboxPid())), 0644); err != nil {
+			return nil, fmt.Errorf("error writing PID file: %w", err)
+		}
+	}
+
+	cu.Release()
+	return c, nil
+}
+
 // createRoot returns a cgroup that still needs rollback if creation fails.
 // The caller must stop partially created processes before uninstalling it.
 func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string) (cgroup.Cgroup, error) {
@@ -483,6 +746,9 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			CPULimits:           cpuLimits,
 			CloneIntoCgroupFD:   cloneIntoCgroupFD,
 			Attached:            args.Attached,
+			Stdin:               args.Stdin,
+			Stdout:              args.Stdout,
+			Stderr:              args.Stderr,
 			GoferFilestoreFiles: goferFilestores,
 			GoferMountConfs:     c.GoferMountConfs,
 			MountHints:          mountHints,
@@ -491,6 +757,9 @@ func (c *Container) createRoot(conf *config.Config, args Args, sandboxID string)
 			FSRestoreImagePaths: args.FSRestoreImagePaths,
 			FSRestoreDirect:     args.FSRestoreDirect,
 			NoRootContainer:     args.NoRootContainer,
+			TemplateSandbox:     args.TemplateSandbox,
+			TemplateWorkers:     args.TemplateWorkers,
+			TemplateReadyFile:   args.TemplateReadyFile,
 		}
 		sand, err := sandbox.New(conf, sandArgs)
 		if err != nil {
@@ -1104,8 +1373,19 @@ func (c *Container) Processes() ([]*controlapi.Process, error) {
 // Destroy stops all processes and frees all resources associated with the
 // container.
 func (c *Container) Destroy() error {
+	return c.destroy(nil)
+}
+
+func (c *Container) destroy(seed *sandbox.Sandbox) error {
 	c.requireAllowWrite()
 	log.Debugf("Destroy container, cid: %s", c.ID)
+	if seed != nil {
+		// Acquiring the state lock would recreate the lock file after deletion.
+		if _, err := c.Saver.Stat(); os.IsNotExist(err) {
+			_ = c.Saver.close()
+			return seed.ReapTemplate()
+		}
+	}
 
 	if err := c.Saver.lock(); err != nil {
 		return err
@@ -1115,6 +1395,23 @@ func (c *Container) Destroy() error {
 		_ = c.Saver.close()
 	}()
 
+	if seed != nil && !c.Saver.unchangedLocked() {
+		var saved Container
+		err := c.Saver.loadLocked(&saved)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if !c.isTemplateGeneration(seed, &saved) {
+			// Another handle destroyed this generation. Its creator still owns
+			// the reaper process, but no paths belonging to the replacement.
+			return seed.ReapTemplate()
+		}
+	}
+	return c.destroyLocked()
+}
+
+// Preconditions: c.Saver is locked.
+func (c *Container) destroyLocked() error {
 	// Stored for later use as stop() sets c.Sandbox to nil.
 	sb := c.Sandbox
 
@@ -1129,12 +1426,6 @@ func (c *Container) Destroy() error {
 	var errs []string
 	if err := c.stop(); err != nil {
 		err = fmt.Errorf("stopping container: %v", err)
-		log.Warningf("%v", err)
-		errs = append(errs, err.Error())
-	}
-
-	if err := c.Saver.Destroy(); err != nil {
-		err = fmt.Errorf("deleting container state files: %v", err)
 		log.Warningf("%v", err)
 		errs = append(errs, err.Error())
 	}
@@ -1172,6 +1463,20 @@ func (c *Container) Destroy() error {
 				errs = append(errs, err.Error())
 			}
 		}
+	}
+	for _, filestorePath := range c.ForkFilestorePaths {
+		if err := os.Remove(filestorePath); err != nil && !os.IsNotExist(err) {
+			err = fmt.Errorf("failed to delete fork filestore file %q: %w", filestorePath, err)
+			log.Warningf("%v", err)
+			errs = append(errs, err.Error())
+		}
+	}
+
+	// Drop the ID lock file only after removing all ID-derived filestore paths.
+	if err := c.Saver.Destroy(); err != nil {
+		err = fmt.Errorf("deleting container state files: %v", err)
+		log.Warningf("%v", err)
+		errs = append(errs, err.Error())
 	}
 
 	c.changeStatus(Stopped)
@@ -1328,13 +1633,24 @@ func (c *Container) initGoferConfs(ovlConf config.Overlay2, mountHints *sentryap
 //
 // Precondition: gofer process must be running.
 func (c *Container) createGoferFilestores(ovlConf config.Overlay2, mountHints *sentryapi.PodMountHints) ([]*os.File, error) {
-	var goferFilestores []*os.File
 	// NOTE(gvisor.dev/issue/9834): Create the filestores in the gofer mount
 	// namespace, so that they don't prevent the host mount points from being
 	// unmounted from the host's mount namespace. We will use /proc/pid/root
 	// to access gofer's mount namespace. See proc_pid_root(5).
 	goferRootfs := fmt.Sprintf("/proc/%d/root", c.GoferPid.Load())
+	return c.createGoferFilestoresIn(goferRootfs, ovlConf, mountHints)
+}
 
+// createGoferFilestoresGoferless mirrors createGoferFilestores for the
+// goferless path. Filestore files are created directly in the host mount
+// namespace since there is no separate gofer mount namespace to confine them
+// to.
+func (c *Container) createGoferFilestoresGoferless(ovlConf config.Overlay2, mountHints *sentryapi.PodMountHints) ([]*os.File, error) {
+	return c.createGoferFilestoresIn("" /* goferRootfs */, ovlConf, mountHints)
+}
+
+func (c *Container) createGoferFilestoresIn(goferRootfs string, ovlConf config.Overlay2, mountHints *sentryapi.PodMountHints) ([]*os.File, error) {
+	var goferFilestores []*os.File
 	// Handle rootfs first.
 	rootfsConf := c.GoferMountConfs[0]
 	filestore, err := c.createGoferFilestore(goferRootfs, ovlConf, rootfsConf, c.Spec.Root.Path, mountHints)
@@ -1507,6 +1823,10 @@ func (c *Container) reloadLocked() error {
 	saved := &Container{}
 	if err := c.Saver.loadLocked(saved); err != nil {
 		return fmt.Errorf("loading container metadata: %w", err)
+	}
+	if c.Sandbox != nil && c.Sandbox.Template && !c.isTemplateGeneration(c.Sandbox, saved) {
+		c.Saver.setLoaded(nil)
+		return fmt.Errorf("template %q was replaced", c.ID)
 	}
 	// Stopped is final, and c may know it from CheckStopped or Wait only.
 	if c.Status != Stopped {
@@ -1774,8 +2094,12 @@ func (c *Container) createGoferProcess(conf *config.Config, specFile *os.File, m
 			}
 			cfgIdx++
 		}
+		goferFilestores, err := c.createGoferFilestoresGoferless(conf.GetOverlay2(), mountHints)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("creating goferless filestore files: %w", err)
+		}
 		cu.Release()
-		return ioFiles, nil, nil, nil, nil
+		return ioFiles, goferFilestores, nil, nil, nil
 	}
 
 	// Ensure we don't leak FDs to the gofer process.
@@ -2244,7 +2568,7 @@ func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, spec *specs.Spec, rootDir stri
 		return nil
 	}
 
-	containers, err := LoadSandbox(rootDir, s.ID, LoadOpts{ReadOnly: true})
+	containers, err := LoadSandbox(rootDir, s.ID, LoadOpts{ReadOnly: true, AllowTemplate: s.Template})
 	if err != nil {
 		return fmt.Errorf("loading sandbox containers: %v", err)
 	}
