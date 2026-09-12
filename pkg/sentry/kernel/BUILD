@@ -437,6 +437,7 @@ go_test(
     srcs = [
         "fd_table_test.go",
         "kcov_test.go",
+        "kernel_fork_test.go",
         "kernel_idle_test.go",
         "kernel_restore_test.go",
         "pending_signals_test.go",
@@ -474,5 +475,6 @@ go_test(
         "//pkg/sync",
         "//pkg/tcpip",
         "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

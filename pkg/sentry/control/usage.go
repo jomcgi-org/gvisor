@@ -32,7 +32,8 @@ type Usage struct {
 	Kernel *kernel.Kernel
 }
 
-// UsageFD returns the file that tracks the memory usage of the application.
+// UsageFD returns the files used to read memory usage outside the Sentry.
+// For private anonymous memory, callers must use Collect.
 func (u *Usage) UsageFD(opts *controlapi.MemoryUsageFileOpts, out *controlapi.MemoryUsageFile) error {
 	// Only support version 1 for now.
 	if opts.Version != 1 {
@@ -40,6 +41,10 @@ func (u *Usage) UsageFD(opts *controlapi.MemoryUsageFileOpts, out *controlapi.Me
 	}
 
 	mf := u.Kernel.MemoryFile()
+	if mf.IsPrivateAnonymous() {
+		return fmt.Errorf("usage FD is unavailable for anonymous memory; use Usage.Collect")
+	}
+
 	*out = controlapi.MemoryUsageFile{
 		FilePayload: urpc.FilePayload{
 			Files: []*os.File{

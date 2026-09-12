@@ -56,8 +56,8 @@ type MemoryFile struct {
 	memmap.DefaultMemoryType
 	memmap.NoBufferedIOFallback
 
-	// MemoryFile owns a single backing file. Each page in the backing file is
-	// considered "committed" or "uncommitted". A page is committed if the host
+	// MemoryFile owns a file but can also store data in anonymous mappings.
+	// Each page is either committed or uncommitted. A page is committed if the host
 	// kernel is spending resources to store its contents and uncommitted
 	// otherwise. This definition includes pages that the host kernel has
 	// swapped. This is intentional; it means that committed pages can only
@@ -67,9 +67,8 @@ type MemoryFile struct {
 	// Each page in the MemoryFile is in one of the following logical states,
 	// protected by mu:
 	//
-	// - Void: Pages beyond the backing file's current size cannot store data.
-	// Void pages are uncommitted. Extending the file's size transitions pages
-	// between the old and new sizes from void to free.
+	// - Void: Pages beyond the currently mapped chunks cannot store data.
+	// Extending the MemoryFile transitions pages from void to free.
 	//
 	// - Free: Free pages are immediately allocatable. Free pages are
 	// uncommitted, and implicitly zeroed. Free pages become used when they are
@@ -391,6 +390,11 @@ type MemoryFileOpts struct {
 	// If DisableMemoryAccounting is true, memory usage observed by the
 	// MemoryFile will not be reported in usage.MemoryAccounting.
 	DisableMemoryAccounting bool
+
+	// PrivateAnonymousMapping backs guest pages with private anonymous mappings
+	// so forked processes get copy-on-write memory. The file is kept for
+	// identity and restore. DiskBackedFile takes precedence.
+	PrivateAnonymousMapping bool
 }
 
 // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
@@ -466,7 +470,7 @@ func NewMemoryFile(file *os.File, opts MemoryFileOpts) (*MemoryFile, error) {
 
 	go f.releaserMain() // S/R-SAFE: f.mu
 
-	if !opts.DisableIMAWorkAround {
+	if !opts.DisableIMAWorkAround && !f.IsPrivateAnonymous() {
 		hostmm.IMAWorkAroundForMemFile(file.Fd())
 	}
 	return f, nil
@@ -636,7 +640,10 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 	}
 
 	var dsts safemem.BlockSeq
-	if alloc.willCommit {
+	if f.IsPrivateAnonymous() && opts.Mode == AllocateAndCommit && !alloc.recycled {
+		// Fresh anonymous pages must be faulted in to commit them.
+		f.touchZeroPages(fr, int(hostarch.PageSize))
+	} else if alloc.willCommit {
 		needHugeTouch := false
 		if alloc.recycled {
 			// We will need writable page table entries in our address space to
@@ -706,12 +713,7 @@ func (f *MemoryFile) Allocate(length uint64, opts AllocOpts) (memmap.FileRange, 
 				// need to zero them.
 				f.manuallyZero(fr)
 			} else if needHugeTouch {
-				// We only need to touch a single byte in each huge page.
-				f.forEachMappingSlice(fr, func(bs []byte) {
-					for i := 0; i < len(bs); i += int(hostarch.HugePageSize) {
-						bs[i] = 0
-					}
-				})
+				f.touchZeroPages(fr, int(hostarch.HugePageSize))
 			}
 		default:
 			panic(fmt.Sprintf("unknown AllocOpts.Mode %d", alloc.opts.Mode))
@@ -938,15 +940,19 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
 	// In tests, f.file may be nil.
 	var mapStart uintptr
 	if f.file != nil {
-		if err := f.file.Truncate(int64(newFileSize)); err != nil {
+		mmapFlags := uintptr(unix.MAP_SHARED)
+		if f.IsPrivateAnonymous() {
+			mmapFlags = unix.MAP_PRIVATE | unix.MAP_ANON
+		} else if err := f.file.Truncate(int64(newFileSize)); err != nil {
 			return err
 		}
+
 		m, _, errno := unix.Syscall6(
 			unix.SYS_MMAP,
 			0,
 			uintptr(incFileSize),
 			unix.PROT_READ|unix.PROT_WRITE,
-			unix.MAP_SHARED,
+			mmapFlags,
 			f.file.Fd(),
 			uintptr(oldFileSize))
 		if errno != 0 {
@@ -1120,6 +1126,15 @@ func (f *MemoryFile) Decommit(fr memmap.FileRange) {
 	})
 }
 
+// touchZeroPages faults in a zeroed range by writing one byte per page.
+func (f *MemoryFile) touchZeroPages(fr memmap.FileRange, pageSize int) {
+	f.forEachMappingSlice(fr, func(bs []byte) {
+		for i := 0; i < len(bs); i += pageSize {
+			bs[i] = 0
+		}
+	})
+}
+
 func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
 	// "The default operation (i.e., mode is zero) of fallocate() allocates the
 	// disk space within the range specified by offset and len." - fallocate(2)
@@ -1131,6 +1146,19 @@ func (f *MemoryFile) commitFile(fr memmap.FileRange) error {
 }
 
 func (f *MemoryFile) decommitFile(fr memmap.FileRange) error {
+	if f.IsPrivateAnonymous() {
+		// For private-anon backings there is no backing file to punch a
+		// hole in; release the resident pages via MADV_DONTNEED on the
+		// per-chunk mappings instead.
+		var err error
+		f.forEachMappingSlice(fr, func(bs []byte) {
+			if e := unix.Madvise(bs, unix.MADV_DONTNEED); e != nil {
+				err = e
+			}
+		})
+		return err
+	}
+
 	// "After a successful call, subsequent reads from this range will
 	// return zeroes. The FALLOC_FL_PUNCH_HOLE flag must be ORed with
 	// FALLOC_FL_KEEP_SIZE in mode ..." - fallocate(2)
@@ -1632,13 +1660,18 @@ func (f *MemoryFile) UpdateUsage(memCgIDs map[uint32]struct{}) error {
 	}
 
 	// If we already know of every committed page, skip scanning.
-	currentUsage, err := f.TotalUsage()
-	if err != nil {
-		return err
+	var currentUsage uint64
+	var err error
+	if !f.IsPrivateAnonymous() {
+		currentUsage, err = f.TotalUsage()
+		if err != nil {
+			return err
+		}
 	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if currentUsage == f.knownCommittedBytes {
+	if !f.IsPrivateAnonymous() && currentUsage == f.knownCommittedBytes {
 		return nil
 	}
 
@@ -1835,6 +1868,15 @@ func (updateUsageDuringSaveErr) Error() string {
 // Mapped (which is external to MemoryFile). This is generally much cheaper
 // than UpdateUsage, but will not provide a fine-grained breakdown.
 func (f *MemoryFile) TotalUsage() (uint64, error) {
+	if f.IsPrivateAnonymous() {
+		if err := f.UpdateUsage(nil); err != nil {
+			return 0, err
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.knownCommittedBytes, nil
+	}
+
 	// Stat the underlying file to discover the underlying usage. stat(2)
 	// always reports the allocated block count in units of 512 bytes. This
 	// includes pages in the page cache and swapped pages.
@@ -1859,6 +1901,10 @@ func (f *MemoryFile) File() *os.File {
 
 // DataFD implements memmap.File.DataFD.
 func (f *MemoryFile) DataFD(fr memmap.FileRange) (int, error) {
+	if f.IsPrivateAnonymous() {
+		return -1, linuxerr.EOPNOTSUPP
+	}
+
 	if amfl := f.asyncPageLoad.Load(); amfl != nil {
 		if err := amfl.awaitLoad(fr); err != nil {
 			return -1, err
@@ -1870,6 +1916,11 @@ func (f *MemoryFile) DataFD(fr memmap.FileRange) (int, error) {
 // FD implements memmap.File.FD.
 func (f *MemoryFile) FD() int {
 	return int(f.file.Fd())
+}
+
+// IsPrivateAnonymous reports whether allocations have no file backing.
+func (f *MemoryFile) IsPrivateAnonymous() bool {
+	return f.opts.PrivateAnonymousMapping && !f.IsDiskBacked()
 }
 
 // IsDiskBacked returns true if f is backed by a file on disk.
@@ -1973,6 +2024,38 @@ func (f *MemoryFile) startEvictionGoroutineLocked(user EvictableMemoryUser, info
 // allocations.
 func (f *MemoryFile) WaitForEvictions() {
 	f.evictionWG.Wait()
+}
+
+// RegenerateMappings replaces all chunk mappings of f with mappings of its
+// current backing file at the same addresses.
+//
+// Preconditions: No concurrent operations may access f's mappings.
+func (f *MemoryFile) RegenerateMappings() error {
+	if f.file == nil {
+		return fmt.Errorf("memory file has no backing file")
+	}
+
+	chunks := f.chunksLoad()
+	for i := range chunks {
+		chunk := &chunks[i]
+		if chunk.mapping == 0 {
+			return fmt.Errorf("memory file chunk %d has no mapping", i)
+		}
+
+		_, _, errno := unix.Syscall6(
+			unix.SYS_MMAP,
+			chunk.mapping,
+			chunkSize,
+			unix.PROT_READ|unix.PROT_WRITE,
+			unix.MAP_SHARED|unix.MAP_FIXED,
+			f.file.Fd(),
+			uintptr(i)*chunkSize)
+		if errno != 0 {
+			return fmt.Errorf("failed to remap MemoryFile chunk %d at %#x: %w", i, chunk.mapping, errno)
+		}
+		f.madviseChunkMapping(chunk.mapping, chunkSize, chunk.huge)
+	}
+	return nil
 }
 
 type unwasteSetFunctions struct{}
