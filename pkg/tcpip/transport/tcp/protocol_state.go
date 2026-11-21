@@ -17,15 +17,27 @@ package tcp
 import (
 	"context"
 	"fmt"
+
+	cryptorand "gvisor.dev/gvisor/pkg/rand"
 )
 
 // afterLoad is invoked by stateify.
-func (p *protocol) afterLoad(ctx context.Context) {
-	rng := p.stack.SecureRNG()
+func (p *protocol) afterLoad(context.Context) {
+	p.resetSecrets(p.stack.SecureRNG())
+}
+
+func (p *protocol) resetSecrets(rng cryptorand.RNG) {
 	if n, err := rng.Reader.Read(p.seqnumSecret[:]); err != nil || n != len(p.seqnumSecret) {
 		panic(fmt.Sprintf("rng.Reader.Read(seqnumSecret) failed: n=%d err=%v", n, err))
 	}
 	if n, err := rng.Reader.Read(p.tsOffsetSecret[:]); err != nil || n != len(p.tsOffsetSecret) {
 		panic(fmt.Sprintf("rng.Reader.Read(tsOffsetSecret) failed: n=%d err=%v", n, err))
 	}
+}
+
+// ResetRandomState replaces random state used for future TCP operations.
+// Preconditions: p's stack must be externally quiesced.
+func (p *protocol) ResetRandomState(rng cryptorand.RNG) {
+	p.resetSecrets(rng)
+	p.dispatcher.resetRandomState(p.stack.InsecureRNG())
 }

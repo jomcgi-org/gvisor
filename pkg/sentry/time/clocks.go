@@ -75,4 +75,7 @@ type Clocks interface {
 	// TSCSnapshot returns the realtime clock's current base point, expressed
 	// in the guest TSC domain, and whether it is valid.
 	TSCSnapshot() (TSCSnapshot, bool)
+
+	// Reset restarts clock calibration, logging msg for diagnostics.
+	Reset(msg string)
 }

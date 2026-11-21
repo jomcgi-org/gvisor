@@ -131,6 +131,9 @@ func readVDSOParams(tb testing.TB, params *VDSOParamPage) vdsoParams {
 	return p
 }
 
+// Reset implements sentrytime.Clocks.Reset. It does nothing.
+func (*mockClocks) Reset(string) {}
+
 // stateTestClocklessTimekeeper returns a test Timekeeper which has not had
 // SetClocks called.
 func stateTestClocklessTimekeeper(tb testing.TB) (*Timekeeper, *VDSOParamPage) {

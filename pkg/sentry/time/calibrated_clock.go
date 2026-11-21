@@ -342,3 +342,12 @@ func (c *CalibratedClocks) TSCSnapshot() (TSCSnapshot, bool) {
 		Frequency:    p.Frequency,
 	}, true
 }
+
+// Reset implements Clocks.Reset.
+func (c *CalibratedClocks) Reset(msg string) {
+	c.monotonic.reset(msg)
+	c.realtime.reset(msg)
+	if c.monotonicRaw != nil {
+		c.monotonicRaw.reset(msg)
+	}
+}
