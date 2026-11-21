@@ -311,27 +311,11 @@ func newMachine(vm int, config *Config) (*machine, error) {
 		panic(fmt.Sprintf("error setting config parameters: %s", err))
 	}
 
-	// Pull the maximum vCPUs.
-	m.getMaxVCPU()
-	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
-	m.vCPUsByTID = make(map[uint64]*vCPU)
-	m.vCPUsByID = make([]*vCPU, m.maxVCPUs)
+	m.initVCPUTables()
 	m.kernel.Init(m.maxVCPUs)
 
-	// Pull the maximum slots.
-	maxSlots, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
-	if errno != 0 {
-		m.maxSlots = _KVM_NR_MEMSLOTS
-	} else {
-		m.maxSlots = int(maxSlots)
-	}
-	log.Debugf("The maximum number of slots is %d.", m.maxSlots)
-	m.usedSlots = make([]uintptr, m.maxSlots)
-
-	// Check TSC Scaling
-	hasTSCControl, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
-	m.tscControl = errno == 0 && hasTSCControl == 1
-	log.Debugf("TSC scaling support: %t.", m.tscControl)
+	m.initMemslots()
+	m.initTSCControl()
 
 	// Destroy cannot be used on the error paths below: the machine is not
 	// registered in machinePool yet, so release what was acquired directly.
@@ -358,21 +342,7 @@ func newMachine(vm int, config *Config) (*machine, error) {
 	m.kernel.PageTables = pagetables.NewWithUpper(newAllocator(), m.upperSharedPageTables, ring0.KernelStartAddress)
 	config.StartupTimer.Reached("kvm page tables created")
 
-	// On x86_64, we prefer not to map the entire sentry address space into
-	// the VM due to memory overhead. It is about 3MB for a 40-bit address
-	// space and about 250MB for 46-bit address spaces (modern CPUs).
-	//
-	// Before version 6.9, the memory overhead was two bytes per page.
-	// This issue was fixed by commit a364c014a2c1 ("kvm/x86: allocate the
-	// write-tracking metadata on-demand").
-	//
-	// If the entire address space isn't mapped into the VM, we need to
-	// trap mmap system calls and map sentry memory regions on demand. This
-	// introduces some overhead for mmap system calls, but considering that
-	// mmap isn't called frequently, it seems better than the memory and
-	// startup time overhead introduced by mapping the entire address
-	// space.
-	mapEntireAddressSpace := forceMappingEntireAddressSpace || mapEntireAddressSpaceDefault
+	mapEntireAddressSpace := shouldMapEntireAddressSpace()
 	if mapEntireAddressSpace {
 		archOverrideFaultBlocks()
 	} else {
@@ -397,11 +367,74 @@ func newMachine(vm int, config *Config) (*machine, error) {
 	})
 	config.StartupTimer.Reached("kvm physical regions mapped")
 
+	m.mapCurrentMappings(mapEntireAddressSpace)
+	config.StartupTimer.Reached("kvm virtual regions mapped")
+
+	// Initialize architecture state.
+	if err := m.initArchState(); err != nil {
+		m.Destroy()
+		return nil, err
+	}
+	config.StartupTimer.Reached("kvm arch state initialized")
+
+	// Ensure the machine is cleaned up properly.
+	runtime.SetFinalizer(m, (*machine).Destroy)
+	return m, nil
+}
+
+// initVCPUTables initializes vCPU lookup tables based on the VM's vCPU limit.
+func (m *machine) initVCPUTables() {
+	// Pull the maximum vCPUs.
+	m.getMaxVCPU()
+	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
+	m.vCPUsByTID = make(map[uint64]*vCPU)
+	m.vCPUsByID = make([]*vCPU, m.maxVCPUs)
+}
+
+// initMemslots initializes KVM memslot tracking for the current VM fd.
+func (m *machine) initMemslots() {
+	// Pull the maximum slots.
+	maxSlots, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
+	if errno != 0 {
+		m.maxSlots = _KVM_NR_MEMSLOTS
+	} else {
+		m.maxSlots = int(maxSlots)
+	}
+	log.Debugf("The maximum number of slots is %d.", m.maxSlots)
+	m.usedSlots = make([]uintptr, m.maxSlots)
+}
+
+// initTSCControl checks if the current VM fd supports TSC scaling.
+func (m *machine) initTSCControl() {
+	hasTSCControl, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_TSC_CONTROL)
+	m.tscControl = errno == 0 && hasTSCControl == 1
+	log.Debugf("TSC scaling support: %t.", m.tscControl)
+}
+
+func shouldMapEntireAddressSpace() bool {
+	// On x86_64, we prefer not to map the entire sentry address space into
+	// the VM due to memory overhead. It is about 3MB for a 40-bit address
+	// space and about 250MB for 46-bit address spaces (modern CPUs).
+	//
+	// Before version 6.9, the memory overhead was two bytes per page.
+	// This issue was fixed by commit a364c014a2c1 ("kvm/x86: allocate the
+	// write-tracking metadata on-demand").
+	//
+	// If the entire address space isn't mapped into the VM, we need to
+	// trap mmap system calls and map sentry memory regions on demand. This
+	// introduces some overhead for mmap system calls, but considering that
+	// mmap isn't called frequently, it seems better than the memory and
+	// startup time overhead introduced by mapping the entire address
+	// space.
+	return forceMappingEntireAddressSpace || mapEntireAddressSpaceDefault
+}
+
+func (m *machine) mapCurrentMappings(mapEntireAddressSpace bool) {
 	// Ensure that the currently mapped virtual regions are actually
 	// available in the VM. Note that this doesn't guarantee no future
 	// faults, however it should guarantee that everything is available to
 	// ensure successful vCPU entry.
-	mapRegion := func(vr virtualRegion, flags uint32) {
+	mapRegion := func(vr virtualRegion) {
 		for virtual := vr.virtual; virtual < vr.virtual+vr.length; {
 			translateVirt := virtual
 			if vr.filename == "[vdso]" && len(m.shadowVDSO) > 0 {
@@ -450,7 +483,7 @@ func newMachine(vm int, config *Config) (*machine, error) {
 			vr.length += 1 << 20
 		}
 
-		mapRegion(vr, 0)
+		mapRegion(vr)
 		return false
 	})
 	if len(m.shadowVDSO) > 0 {
@@ -463,18 +496,6 @@ func newMachine(vm int, config *Config) (*machine, error) {
 		}
 	}
 	enableAsyncPreemption()
-	config.StartupTimer.Reached("kvm virtual regions mapped")
-
-	// Initialize architecture state.
-	if err := m.initArchState(); err != nil {
-		m.Destroy()
-		return nil, err
-	}
-	config.StartupTimer.Reached("kvm arch state initialized")
-
-	// Ensure the machine is cleaned up properly.
-	runtime.SetFinalizer(m, (*machine).Destroy)
-	return m, nil
 }
 
 // hasSlot returns true if the given address is mapped.
@@ -542,16 +563,8 @@ func (m *machine) mapTSCOffsetAlias() {
 	m.mapPhysical(physical, hostarch.PageSize)
 }
 
-// Destroy frees associated resources.
-//
-// Destroy should only be called once all active users of the machine are gone.
-// The machine object should not be used after calling Destroy.
-//
-// Precondition: all vCPUs must be returned to the machine.
-func (m *machine) Destroy() {
-	runtime.SetFinalizer(m, nil)
-
-	// Destroy vCPUs.
+// destroyVCPUs closes all vCPU fds and unmaps their KVM_RUN pages.
+func (m *machine) destroyVCPUs() {
 	for _, c := range m.vCPUsByID {
 		if c == nil {
 			continue
@@ -573,6 +586,18 @@ func (m *machine) Destroy() {
 			panic(fmt.Sprintf("error closing vCPU fd: %v", err))
 		}
 	}
+}
+
+// Destroy frees associated resources.
+//
+// Destroy should only be called once all active users of the machine are gone.
+// The machine object should not be used after calling Destroy.
+//
+// Precondition: all vCPUs must be returned to the machine.
+func (m *machine) Destroy() {
+	runtime.SetFinalizer(m, nil)
+
+	m.destroyVCPUs()
 
 	machinePool[m.machinePoolIndex].Store(nil)
 	seccompMmapSync()
@@ -932,6 +957,10 @@ func seccompMmapRules(m *machine) {
 		}
 	})
 
+	m.registerInMachinePool()
+}
+
+func (m *machine) registerInMachinePool() {
 	machinePoolMu.Lock()
 	n := machinePoolLen.Load()
 	i := uint32(0)
