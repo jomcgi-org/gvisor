@@ -226,7 +226,7 @@ func (fs *filesystem) sysDirFiles(ctx context.Context, root *auth.Credentials, k
 		}
 	case "kernel/random":
 		return map[string]kernfs.Inode{
-			"boot_id": fs.newInode(ctx, root, 0444, newStaticFile(k.BootID()+"\n")),
+			"boot_id": fs.newInode(ctx, root, 0444, &bootIDData{}),
 			"uuid":    fs.newInode(ctx, root, 0444, &uuidData{}),
 		}
 	case "kernel/yama":
@@ -404,6 +404,24 @@ func (*domainnameData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	defer utsns.DecRef(ctx)
 	buf.WriteString(utsns.DomainName())
 	buf.WriteString("\n")
+	return nil
+}
+
+// bootIDData implements vfs.DynamicBytesSource for
+// /proc/sys/kernel/random/boot_id. It reads the kernel's boot ID on every read,
+// so that a sandbox forked from a template can get a new one.
+//
+// +stateify savable
+type bootIDData struct {
+	kernfs.DynamicBytesFile
+}
+
+var _ dynamicInode = (*bootIDData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (*bootIDData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	buf.WriteString(kernel.KernelFromContext(ctx).BootID())
+	buf.WriteByte('\n')
 	return nil
 }
 

@@ -1389,6 +1389,16 @@ func (k *Kernel) BootID() string {
 	return k.bootID
 }
 
+// ResetBootID discards the boot ID, so that the next BootID call generates a
+// new one. A sandbox forked from a template calls it: until then every child
+// reports the boot ID that the template generated or read during its
+// initialization.
+func (k *Kernel) ResetBootID() {
+	k.bootIDMu.Lock()
+	defer k.bootIDMu.Unlock()
+	k.bootID = ""
+}
+
 // UniqueID returns a unique identifier.
 func (k *Kernel) UniqueID() uint64 {
 	id := k.uniqueID.Add(1)
