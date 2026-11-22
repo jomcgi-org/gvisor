@@ -54,6 +54,10 @@ var (
 	fTimeout  = runscflag.Duration("fb-timeout", 120*time.Second, "per-child result timeout")
 	fBeacon   = runscflag.String("fb-beacon", "", "if set, write a line 'phase=<name> pids=...' file for external PSS sampling")
 	fWorkers  = runscflag.Int("fb-template-workers", 1, "template workers")
+	fPad      = runscflag.Int("fb-pad-bytes", 0, "append PAD=<N bytes of x> to each child's ForkArgs.Env (request channel size test)")
+	fProd     = runscflag.Bool("fb-production", false, "run the sandbox the production way (unprivileged user, chroot, seccomp) instead of the test-only mode")
+	fMark     = runscflag.Bool("fb-mark", false, "append MARK=<child index> to each child's ForkArgs.Env (heap isolation probe)")
+	fExtraEnv = runscflag.String("fb-fork-env", "", "extra ForkArgs.Env entries, comma separated NAME=VALUE")
 )
 
 type childPids struct {
@@ -92,7 +96,7 @@ func baseConf() *config.Config {
 	conf.Network = config.NetworkNone
 	conf.DirectFS = false
 	conf.CPUNum = *fCPUs
-	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = true
+	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = !*fProd
 	conf.WatchdogAction = "panic"
 	conf.RootDir = filepath.Join(*fWork, "root")
 	return conf
@@ -202,6 +206,22 @@ func main() {
 	fmt.Printf("TEMPLATE destroy_ms=%.1f\n", ms(time.Since(t1)))
 }
 
+// forkEnv builds the per-child ForkArgs.Env. SCAN_TARGET comes first so that a
+// reader with a small buffer still sees it.
+func forkEnv(i int) []string {
+	env := []string{"SCAN_TARGET=" + *fTarget}
+	if *fMark {
+		env = append(env, fmt.Sprintf("MARK=%d", i))
+	}
+	if *fExtraEnv != "" {
+		env = append(env, strings.Split(*fExtraEnv, ",")...)
+	}
+	if *fPad > 0 {
+		env = append(env, "PAD="+strings.Repeat("x", *fPad))
+	}
+	return env
+}
+
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000.0 }
 
 func beacon(phase string, tmplPID int, kids []childPids) {
@@ -209,6 +229,10 @@ func beacon(phase string, tmplPID int, kids []childPids) {
 	for _, k := range kids {
 		line += fmt.Sprintf(" child=%d", k.PID)
 	}
+	for _, k := range kids {
+		line += fmt.Sprintf(" cid=%s", k.ID)
+	}
+	line += " root=" + *fWork + "/root"
 	fmt.Println("BEACON " + line)
 	if *fBeacon != "" {
 		os.WriteFile(*fBeacon, []byte(line+"\n"), 0644)
@@ -241,7 +265,7 @@ func runRound(conf *config.Config, tmpl *container.Template, runDir string, n, r
 			t0mu.Unlock()
 			c, err := tmpl.Fork(conf, container.ForkArgs{
 				ID:          id,
-				Env:         []string{"SCAN_TARGET=" + *fTarget},
+				Env:         forkEnv(i),
 				BundleDir:   filepath.Join(*fWork, "bundle"),
 				Stdout:      out,
 				Stderr:      errf,
