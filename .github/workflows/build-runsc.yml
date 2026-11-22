@@ -27,6 +27,15 @@ jobs:
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+    - name: Build prerequisites
+      run: |
+        # images/default/Dockerfile lists these for running bazel directly.
+        # The CC toolchain calls x86_64-linux-gnu-gcc, which needs the matching ld.
+        sudo apt-get update -qq
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+          build-essential crossbuild-essential-amd64 clang pkg-config libffi-dev \
+          libssl-dev patch zip unzip erofs-utils busybox-static
+
     - name: Bazelisk
       run: |
         if ! command -v bazelisk >/dev/null; then
