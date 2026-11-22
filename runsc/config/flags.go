@@ -122,6 +122,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Var(leakModePtr(refs.NoLeakChecking), "ref-leak-mode", "sets reference leak check mode: disabled (default), log-names, log-traces.")
 	flagSet.Bool("cpu-num-from-quota", true, "set cpu number to cpu quota (least integer greater or equal to quota value, but not less than 2)")
 	flagSet.Int("cpu-num", 0, "number of CPUs to create inside the sandbox. 0 (default) leaves CPU count detection unchanged.")
+	flagSet.String("fork-namespaces", "ipc,net", "host namespaces, besides mount, UTS and PID, that each sandbox forked from a template gets of its own: a comma separated list of ipc, net and cgroup, or none.")
 	flagSet.Bool(flagOCISeccomp, false, "Enables loading OCI seccomp filters inside the sandbox.")
 	flagSet.Bool("enable-core-tags", false, "enables core tagging. Requires host linux kernel >= 5.14.")
 	flagSet.Var(SignalUnkillableNone.Ptr(), "signal-unkillable-policy", "controls protection of PID namespace init processes from signals under Linux SIGNAL_UNKILLABLE semantics: none (default) or linux.")

@@ -344,6 +344,12 @@ type Config struct {
 	// CPU count detection unchanged.
 	CPUNum int `flag:"cpu-num"`
 
+	// ForkNamespaces lists the host namespaces, besides the mount, UTS and PID
+	// namespaces, that each sandbox forked from a template gets of its own:
+	// "ipc", "net" and "cgroup", comma separated, or "none". Forked children
+	// otherwise share these namespaces with the template and each other.
+	ForkNamespaces string `flag:"fork-namespaces"`
+
 	// Allows overriding of flags in OCI annotations.
 	AllowFlagOverride bool `flag:"allow-flag-override"`
 
@@ -606,6 +612,9 @@ func (c *Config) Validate() error {
 	if c.CPUNum < 0 {
 		return fmt.Errorf("cpu-num must be >= 0, got: %d", c.CPUNum)
 	}
+	if _, err := ParseForkNamespaces(c.ForkNamespaces); err != nil {
+		return fmt.Errorf("fork-namespaces: %w", err)
+	}
 	if c.PauseExternalNetworking && c.Network != NetworkSandbox {
 		return fmt.Errorf("pause-external-networking flag is only supported with sandbox networking")
 	}
@@ -670,6 +679,7 @@ func (c *Config) Log() {
 	log.Infof("FileAccess: %v / Directfs: %t / Overlay: %v", c.FileAccess, c.DirectFS, c.GetOverlay2())
 	log.Infof("Network: %v", c.Network)
 	log.Infof("CPUNum: %d", c.CPUNum)
+	log.Infof("ForkNamespaces: %q", c.ForkNamespaces)
 	log.Infof("UseCPUNums: %t", c.UseCPUNums)
 	if c.Debug || c.Strace {
 		log.Infof("Debug: %t. Strace: %t, max size: %d, syscalls: %s", c.Debug, c.Strace, c.StraceLogSize, c.StraceSyscalls)
@@ -1988,4 +1998,34 @@ func (p StateEnginePolicy) String() string {
 	default:
 		panic(fmt.Sprintf("invalid state engine policy %d", p))
 	}
+}
+
+// ForkNamespace names a host namespace that a forked child can get of its own.
+type ForkNamespace string
+
+// Namespaces a child forked from a template sandbox can get of its own.
+const (
+	ForkNamespaceIPC    ForkNamespace = "ipc"
+	ForkNamespaceNet    ForkNamespace = "net"
+	ForkNamespaceCgroup ForkNamespace = "cgroup"
+)
+
+// ParseForkNamespaces parses the value of the fork-namespaces flag.
+func ParseForkNamespaces(s string) ([]ForkNamespace, error) {
+	var out []ForkNamespace
+	seen := make(map[ForkNamespace]bool)
+	for _, name := range strings.Split(s, ",") {
+		name = strings.TrimSpace(name)
+		switch ns := ForkNamespace(name); ns {
+		case "", "none":
+		case ForkNamespaceIPC, ForkNamespaceNet, ForkNamespaceCgroup:
+			if !seen[ns] {
+				seen[ns] = true
+				out = append(out, ns)
+			}
+		default:
+			return nil, fmt.Errorf("unknown namespace %q, want ipc, net, cgroup or none", name)
+		}
+	}
+	return out, nil
 }

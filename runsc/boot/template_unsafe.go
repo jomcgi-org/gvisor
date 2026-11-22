@@ -22,6 +22,7 @@ import (
 	"github.com/moby/sys/capability"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
 //go:nosplit
@@ -195,6 +196,27 @@ func finishForkProcessSetup() syscall.Errno {
 	return errno
 }
 
+// forkNamespaceFlags returns the clone flags for the namespaces named by the
+// fork-namespaces setting.
+func forkNamespaceFlags(setting string) (int, error) {
+	list, err := config.ParseForkNamespaces(setting)
+	if err != nil {
+		return 0, err
+	}
+	var flags int
+	for _, ns := range list {
+		switch ns {
+		case config.ForkNamespaceIPC:
+			flags |= syscall.CLONE_NEWIPC
+		case config.ForkNamespaceNet:
+			flags |= syscall.CLONE_NEWNET
+		case config.ForkNamespaceCgroup:
+			flags |= unix.CLONE_NEWCGROUP
+		}
+	}
+	return flags, nil
+}
+
 // clone fires runtime.Clone with the template's CLONE_NEW{NS,UTS,PID} flags
 // and returns the accepted client socket fd in the child.
 func (l *Loader) clone(stubPath string, stubFD int) int {
@@ -222,10 +244,22 @@ func (l *Loader) clone(stubPath string, stubFD int) int {
 
 	defer func() { cloneCtx = nil }()
 
-	// Share the template's host IPC namespace intentionally. CLONE_NEWIPC
-	// creates an mqueue superblock, and high sandbox churn can make sget_fc() a
-	// latency bottleneck. Guest IPC isolation is implemented by the sentry.
+	// The mount, UTS and PID namespaces are always new. The IPC, network and
+	// cgroup namespaces are new when the fork-namespaces setting names them.
+	// CLONE_NEWIPC creates an mqueue superblock, and high sandbox churn can
+	// make sget_fc() a latency bottleneck; see the fork-namespaces flag for the
+	// measured cost. A user namespace is not created: with CLONE_NEWUSER
+	// together with CLONE_NEWNS the inherited /proc mount is locked and the
+	// child's umount2 fails with EINVAL, and the children have no capability and
+	// the same kernel UID either way, so a user namespace would add no
+	// credential separation.
 	flags := int(syscall.SIGCHLD | syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID)
+	nsFlags, err := forkNamespaceFlags(l.root.conf.ForkNamespaces)
+	if err != nil {
+		// Config.Validate rejects this value before the sandbox starts.
+		panic(fmt.Errorf("invalid fork-namespaces setting: %w", err))
+	}
+	flags |= nsFlags
 
 	runtimeClone(preclone, waiting, postclone, flags, l.templateWorkers, templateReady)
 
