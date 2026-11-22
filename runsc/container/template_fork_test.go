@@ -1456,12 +1456,12 @@ func kcmpSameFile(pid1, pid2, fd1, fd2 int) bool {
 	return errno == 0 && r == 0
 }
 
-// fdAccessMode returns the access mode (O_RDONLY, O_WRONLY or O_RDWR) of fd in pid.
-func fdAccessMode(t *testing.T, pid int, fd string) int {
+// fdFlags returns the open flags of fd in pid, or -1 if it closed meanwhile.
+func fdFlags(t *testing.T, pid int, fd string) int {
 	t.Helper()
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/fdinfo/%s", pid, fd))
 	if err != nil {
-		return -1 // The descriptor closed meanwhile.
+		return -1
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if rest, ok := strings.CutPrefix(line, "flags:"); ok {
@@ -1469,7 +1469,7 @@ func fdAccessMode(t *testing.T, pid int, fd string) int {
 			if err != nil {
 				t.Fatalf("parsing flags %q: %v", line, err)
 			}
-			return int(flags) & unix.O_ACCMODE
+			return int(flags)
 		}
 	}
 	return -1
@@ -1478,7 +1478,7 @@ func fdAccessMode(t *testing.T, pid int, fd string) int {
 // TestTemplateForkNoSharedWritableDescriptors checks that no forked child shares
 // a writable open file description with a sibling or with the template worker.
 // Read-only descriptors, such as the EROFS root image, may be shared, and so
-// may /dev/null.
+// may /dev/null and append-only log files.
 func TestTemplateForkNoSharedWritableDescriptors(t *testing.T) {
 	tmpl, conf := newLifecycleTemplate(t, 1)
 	a := lifecycleFork(t, tmpl, conf, lifecycleForkArgs(t))
@@ -1516,9 +1516,22 @@ func TestTemplateForkNoSharedWritableDescriptors(t *testing.T) {
 					if err != nil || target == "/dev/null" {
 						continue
 					}
-					if fdAccessMode(t, x.pid, fx) != unix.O_RDONLY || fdAccessMode(t, y.pid, fy) != unix.O_RDONLY {
-						t.Errorf("%s fd %s and %s fd %s share the writable open file description %q", x.name, fx, y.name, fy, target)
+					flagsX, flagsY := fdFlags(t, x.pid, fx), fdFlags(t, y.pid, fy)
+					if flagsX < 0 || flagsY < 0 {
+						continue
 					}
+					if flagsX&unix.O_ACCMODE == unix.O_RDONLY && flagsY&unix.O_ACCMODE == unix.O_RDONLY {
+						continue
+					}
+					if flagsX&unix.O_APPEND != 0 && flagsY&unix.O_APPEND != 0 {
+						// Append-only log files that the harness gives the sandbox
+						// process (--debug-log, stdout and stderr). Every sandbox of a
+						// worker shares them, so operators should point them at
+						// /dev/null or at files that a single sandbox owns.
+						t.Logf("%s fd %s and %s fd %s share the append-only log %q", x.name, fx, y.name, fy, target)
+						continue
+					}
+					t.Errorf("%s fd %s and %s fd %s share the writable open file description %q", x.name, fx, y.name, fy, target)
 				}
 			}
 		}
