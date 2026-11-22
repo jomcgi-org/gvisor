@@ -74,6 +74,7 @@ jobs:
           //runsc/container:container_test \
           //runsc/container:template_fork_startup_benchmark_test \
           //runsc/container:template_fork_e2e_test \
+          //test/cmd/forkbench \
           //test/cmd/fork_ready \
           //test/cmd/fork_state \
           //test/cmd/test_app
@@ -98,11 +99,12 @@ jobs:
         done
         tar -C out -czf out/runsc-release.tar.gz release
         for b in fork_ready fork_state test_app; do
-          cp -L "$BB/test/cmd/$b/${b}_/$b" "out/$b"
+          cp -L "$BB/test/cmd/$b/${b}_/$b" "out/$b" 2>/dev/null || cp -L "$BB/test/cmd/$b/$b" "out/$b"
         done
+        cp -L "$BB/test/cmd/forkbench/forkbench_/forkbench" out/forkbench
         cd out
         ls -lh
-        sha256sum runsc-release.tar.gz *.runfiles.tar.gz fork_ready fork_state test_app > sha256sums.txt
+        sha256sum runsc-release.tar.gz *.runfiles.tar.gz fork_ready fork_state test_app forkbench > sha256sums.txt
         (cd release && find . -type f -print0 | sort -z | xargs -0 sha256sum) > release-files.sha256
         cat sha256sums.txt release-files.sha256
 
@@ -117,6 +119,7 @@ jobs:
           out/fork_ready
           out/fork_state
           out/test_app
+          out/forkbench
 
     - name: Upload test binaries
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
