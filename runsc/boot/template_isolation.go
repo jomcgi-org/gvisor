@@ -31,6 +31,10 @@ import (
 //   - the shared anonymous mapping that reserves the KVM ioeventfd addresses
 //     (replaced by KVM.Reload).
 //
+// It also gives the child its own boot ID. The guest's view of the boot ID would
+// otherwise be the template's, shared by every child, if anything read it
+// during the template's initialization.
+//
 // Without this, a compromised child holds a read-write channel to every
 // sibling. It runs in the child before the guest resumes and before the
 // seccomp filter is installed, because the filter forbids pipe2.
@@ -46,5 +50,6 @@ func resetInheritedForkState(l *Loader) error {
 	if err := l.k.MemoryFile().RebindBackingFile(); err != nil {
 		return fmt.Errorf("fork isolation: %w", err)
 	}
+	l.k.ResetBootID()
 	return nil
 }
