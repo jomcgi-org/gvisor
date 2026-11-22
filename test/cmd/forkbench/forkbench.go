@@ -58,6 +58,10 @@ var (
 	fProd     = runscflag.Bool("fb-production", false, "run the sandbox the production way (unprivileged user, chroot, seccomp) instead of the test-only mode")
 	fMark     = runscflag.Bool("fb-mark", false, "append MARK=<child index> to each child's ForkArgs.Env (heap isolation probe)")
 	fExtraEnv = runscflag.String("fb-fork-env", "", "extra ForkArgs.Env entries, comma separated NAME=VALUE")
+	fNS       = runscflag.String("fb-ns", "", "if set, overrides the fork-namespaces setting: comma separated ipc, net, cgroup, or none")
+	fCgParent = runscflag.String("fb-cgroup-parent", "", "if set, a cgroup v2 directory with the pids and memory controllers enabled; each child gets <dir>/<id> as ForkArgs.CgroupPath")
+	fPidsMax  = runscflag.String("fb-pids-max", "", "pids.max written to each child cgroup (needs -fb-cgroup-parent)")
+	fMemMax   = runscflag.String("fb-mem-max", "", "memory.max written to each child cgroup, with swap disabled (needs -fb-cgroup-parent)")
 )
 
 type childPids struct {
@@ -99,7 +103,54 @@ func baseConf() *config.Config {
 	conf.TestOnlyAllowRunAsCurrentUserWithoutChroot = !*fProd
 	conf.WatchdogAction = "panic"
 	conf.RootDir = filepath.Join(*fWork, "root")
+	if *fNS != "" {
+		conf.ForkNamespaces = *fNS
+	}
 	return conf
+}
+
+// childCgroup creates the cgroup for child id under -fb-cgroup-parent and
+// writes the requested limits. It returns "" when no cgroup parent is set.
+func childCgroup(id string) string {
+	if *fCgParent == "" {
+		return ""
+	}
+	dir := filepath.Join(*fCgParent, id)
+	must(os.Mkdir(dir, 0755), "mkdir cgroup "+dir)
+	for file, val := range map[string]string{"pids.max": *fPidsMax, "memory.max": *fMemMax} {
+		if val != "" {
+			must(os.WriteFile(filepath.Join(dir, file), []byte(val), 0644), "write "+file)
+		}
+	}
+	if *fMemMax != "" {
+		// Swap would hide the memory limit.
+		if err := os.WriteFile(filepath.Join(dir, "memory.swap.max"), []byte("0"), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "forkbench: memory.swap.max: %v\n", err)
+		}
+	}
+	return dir
+}
+
+// cgroupReport prints the cgroup counters of a child as one CGROUP line.
+func cgroupReport(id, dir string) {
+	if dir == "" {
+		return
+	}
+	var parts []string
+	for _, f := range []string{"pids.max", "pids.current", "pids.peak", "pids.events", "memory.max", "memory.current", "memory.peak", "memory.events", "cgroup.procs"} {
+		b, err := os.ReadFile(filepath.Join(dir, f))
+		if err != nil {
+			parts = append(parts, f+"=ERR")
+			continue
+		}
+		v := strings.Join(strings.Fields(string(b)), ",")
+		if f == "cgroup.procs" {
+			v = fmt.Sprintf("%d", len(strings.Fields(string(b))))
+			f = "procs"
+		}
+		parts = append(parts, f+"="+v)
+	}
+	fmt.Printf("CGROUP id=%s dir=%s %s\n", id, dir, strings.Join(parts, " "))
 }
 
 func appendFile(path string) *os.File {
@@ -242,6 +293,7 @@ func beacon(phase string, tmplPID int, kids []childPids) {
 func runRound(conf *config.Config, tmpl *container.Template, runDir string, n, rep int) []sample {
 	samples := make([]sample, n)
 	kids := make([]*container.Container, n)
+	cgDirs := make([]string, n)
 	pids := make([]childPids, n)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -263,6 +315,7 @@ func runRound(conf *config.Config, tmpl *container.Template, runDir string, n, r
 			t0mu.Lock()
 			t0 := hostT0
 			t0mu.Unlock()
+			cgDirs[i] = childCgroup(id)
 			c, err := tmpl.Fork(conf, container.ForkArgs{
 				ID:          id,
 				Env:         forkEnv(i),
@@ -270,6 +323,7 @@ func runRound(conf *config.Config, tmpl *container.Template, runDir string, n, r
 				Stdout:      out,
 				Stderr:      errf,
 				NetworkArgs: loopbackOnly(),
+				CgroupPath:  cgDirs[i],
 			})
 			s.ForkAPIMS = ms(time.Since(t0))
 			if err != nil {
@@ -316,11 +370,19 @@ func runRound(conf *config.Config, tmpl *container.Template, runDir string, n, r
 	beacon(fmt.Sprintf("children-n%d-rep%d", n, rep), tmpl.PID, live)
 	// Give an external sampler time to read the beacon.
 	time.Sleep(time.Duration(*fHold) * time.Millisecond)
-	for _, c := range kids {
+	for i := range kids {
+		if cgDirs[i] != "" {
+			cgroupReport(filepath.Base(cgDirs[i]), cgDirs[i])
+		}
+	}
+	for i, c := range kids {
 		if c != nil {
 			if err := c.Destroy(); err != nil {
 				fmt.Fprintf(os.Stderr, "destroy: %v\n", err)
 			}
+		}
+		if cgDirs[i] != "" {
+			os.Remove(cgDirs[i])
 		}
 	}
 	for _, s := range samples {
