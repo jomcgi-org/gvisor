@@ -336,3 +336,35 @@ benchmark_test(
         "@org_golang_x_sys//unix:go_default_library",
     ],
 )
+
+go_test(
+    name = "template_fork_semgrep_net_test",
+    size = "large",
+    srcs = [
+        "container_testutil_test.go",
+        "template_fork_e2e_test.go",
+        "template_fork_semgrep_net_test.go",
+    ],
+    data = ["//:release"],
+    embed = [":container"],
+    tags = [
+        "manual",
+        "requires-kvm",
+    ],
+    deps = [
+        "//pkg/abi/linux",
+        "//pkg/control/client",
+        "//pkg/log",
+        "//pkg/sentry/fsimpl/erofs",
+        "//pkg/test/testutil",
+        "//pkg/urpc",
+        "//runsc/boot/sentryapi",
+        "//runsc/config",
+        "//runsc/flag",
+        "//runsc/hostsettings",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
+)
