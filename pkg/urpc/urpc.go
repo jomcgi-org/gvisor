@@ -190,6 +190,12 @@ type Server struct {
 	// wg is a wait group for all outstanding clients.
 	wg sync.WaitGroup
 
+	// restricted, if non-nil, is the only set of methods the server serves.
+	// Any other registered method is reported as unknown.
+	//
+	// +checklocks:mu
+	restricted map[string]struct{}
+
 	// afterRPCCallback is called after handling each unmarshalled RPC.
 	// It is immutable after initialization.
 	afterRPCCallback func()
@@ -300,8 +306,31 @@ func (s *Server) Register(obj any) {
 func (s *Server) lookup(method string) (registeredMethod, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.restricted != nil {
+		if _, ok := s.restricted[method]; !ok {
+			return registeredMethod{}, false
+		}
+	}
 	rm, ok := s.methods[method]
 	return rm, ok
+}
+
+// RestrictMethods limits the server to the named methods: every other method is
+// reported as unknown, whether or not it is registered. Calling it without
+// names lifts the restriction. It affects requests that start after it returns.
+//
+// +checklocksexclude:s.mu
+func (s *Server) RestrictMethods(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(names) == 0 {
+		s.restricted = nil
+		return
+	}
+	s.restricted = make(map[string]struct{}, len(names))
+	for _, name := range names {
+		s.restricted[name] = struct{}{}
+	}
 }
 
 // ServeOne handles one RPC, closes client, and returns both the transport
