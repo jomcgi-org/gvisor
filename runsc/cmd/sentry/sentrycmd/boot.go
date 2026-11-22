@@ -504,6 +504,15 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		timer.Reached("chroot set up")
 		argOverride["setup-root"] = "false"
 
+		if b.templateSandbox && b.procUmounterFD >= 0 {
+			// A template never spawns the /proc unmounter: each forked child
+			// unmounts /proc itself. Close the sidecar descriptor so that the
+			// template and every child cloned from it do not hold it.
+			unix.Close(b.procUmounterFD)
+			b.procUmounterFD = -1
+			argOverride["proc-umounter-fd"] = "-1"
+		}
+
 		if !conf.Rootless && !b.templateSandbox {
 			// /proc is umounted from a forked process, because the
 			// current one is going to drop capabilities and won't be
