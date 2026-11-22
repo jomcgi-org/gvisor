@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
       contents: read
@@ -30,7 +30,8 @@ jobs:
     - name: Build prerequisites
       run: |
         # images/default/Dockerfile lists these for running bazel directly.
-        # The CC toolchain calls x86_64-linux-gnu-gcc, which needs the matching ld.
+        # The CC toolchain calls x86_64-linux-gnu-gcc with -fuse-ld=gold, so the runner
+        # must ship ld.gold (ubuntu-24.04 does; the newer ubuntu-latest image does not).
         sudo apt-get update -qq
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
           build-essential crossbuild-essential-amd64 clang pkg-config libffi-dev \
