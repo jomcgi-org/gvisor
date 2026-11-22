@@ -37,6 +37,13 @@ jobs:
         echo "bazel version file: $(cat .bazelversion)"
         bazelisk version
 
+    - name: Restore Bazel disk cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/bazel-disk
+        key: bazel-disk-${{ github.sha }}
+        restore-keys: bazel-disk-
+
     - name: Build
       run: |
         set -euxo pipefail
@@ -61,6 +68,13 @@ jobs:
           //test/cmd/fork_ready \
           //test/cmd/fork_state \
           //test/cmd/test_app
+
+    - name: Save Bazel disk cache
+      if: always()
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/bazel-disk
+        key: bazel-disk-${{ github.sha }}
 
     - name: Stage artifacts
       run: |
