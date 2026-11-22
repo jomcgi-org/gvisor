@@ -177,6 +177,10 @@ func (k *KVM) Reload(devFile *fd.FD) error {
 		return fmt.Errorf("KVM reload requires a dropped VM")
 	}
 
+	if err := rebindIoeventfdMMIO(); err != nil {
+		return err
+	}
+
 	var vm uintptr
 	for {
 		var errno unix.Errno

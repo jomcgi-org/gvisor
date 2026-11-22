@@ -1918,6 +1918,38 @@ func (f *MemoryFile) FD() int {
 	return int(f.file.Fd())
 }
 
+// RebindBackingFile gives f a new, empty backing file at the same descriptor
+// number. A process cloned from a template sandbox calls it so that it does not
+// share the template's file with its siblings.
+//
+// It only applies when allocations have no file backing (IsPrivateAnonymous):
+// the file then holds no pages, so replacing it changes no guest-visible
+// state. The old file must be empty; otherwise RebindBackingFile fails and
+// changes nothing.
+func (f *MemoryFile) RebindBackingFile() error {
+	if !f.IsPrivateAnonymous() || f.file == nil {
+		return fmt.Errorf("memory file is not private-anonymous")
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.file.Fd()), &st); err != nil {
+		return fmt.Errorf("stat memory file: %w", err)
+	}
+	if st.Size != 0 {
+		return fmt.Errorf("memory file holds %d bytes, want an empty file", st.Size)
+	}
+	fd, err := unix.MemfdCreate("runsc-memory", 0)
+	if err != nil {
+		return fmt.Errorf("creating private memory file: %w", err)
+	}
+	// The descriptor never becomes an os.File, so no finalizer can close a
+	// recycled descriptor number.
+	defer unix.Close(fd)
+	if err := unix.Dup3(fd, int(f.file.Fd()), unix.O_CLOEXEC); err != nil {
+		return fmt.Errorf("replacing memory file descriptor: %w", err)
+	}
+	return nil
+}
+
 // IsPrivateAnonymous reports whether allocations have no file backing.
 func (f *MemoryFile) IsPrivateAnonymous() bool {
 	return f.opts.PrivateAnonymousMapping && !f.IsDiskBacked()

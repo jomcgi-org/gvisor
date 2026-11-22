@@ -43,6 +43,32 @@ func init() {
 	tempPipeWriteFD = pipeFDs[1]
 }
 
+// RebindTempPipe gives the calling process its own scratch pipe. A process
+// cloned from a template sandbox calls it: until then the clone holds both ends
+// of the template's pipe, and so does every sibling. Siblings could then read
+// and write each other's scratch bytes.
+//
+// The new pipe replaces the old one at the same descriptor numbers. Callers must
+// run before the sentry installs its seccomp filter, which forbids pipe2.
+func RebindTempPipe() error {
+	var fds [2]int
+	if err := unix.Pipe2(fds[:], unix.O_CLOEXEC); err != nil {
+		return fmt.Errorf("creating scratch pipe: %w", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	tempPipeMu.Lock()
+	defer tempPipeMu.Unlock()
+	if err := unix.Dup3(fds[0], tempPipeReadFD, unix.O_CLOEXEC); err != nil {
+		return fmt.Errorf("replacing scratch pipe read end: %w", err)
+	}
+	if err := unix.Dup3(fds[1], tempPipeWriteFD, unix.O_CLOEXEC); err != nil {
+		return fmt.Errorf("replacing scratch pipe write end: %w", err)
+	}
+	return nil
+}
+
 func blockUntilNonblockingPipeHasWriter(ctx context.Context, fd int32) error {
 	for {
 		ok, err := nonblockingPipeHasWriter(fd)

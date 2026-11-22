@@ -151,6 +151,31 @@ func initIoeventfdMMIO() {
 	})
 }
 
+// rebindIoeventfdMMIO replaces the MMIO address reservation with a new shared
+// anonymous mapping at the same address. A process cloned from a template
+// sandbox calls it through Reload: until then the clone and all its siblings map
+// the same shared memory object, which the mapping's PROT_NONE protection hides
+// only until a compromised sentry changes it.
+func rebindIoeventfdMMIO() error {
+	ioeventfdMMIO.mu.Lock()
+	defer ioeventfdMMIO.mu.Unlock()
+	if ioeventfdMMIO.mapping == 0 {
+		return nil
+	}
+	_, _, errno := unix.Syscall6(
+		unix.SYS_MMAP,
+		ioeventfdMMIO.mapping,
+		uintptr(maxIoeventfds)*8,
+		unix.PROT_NONE,
+		unix.MAP_SHARED|unix.MAP_ANONYMOUS|unix.MAP_FIXED,
+		^uintptr(0),
+		0)
+	if errno != 0 {
+		return fmt.Errorf("replacing ioeventfd MMIO mapping: %w", errno)
+	}
+	return nil
+}
+
 // getIoeventfdMMIOAddr returns an MMIO address that may be used by a
 // kvm_ioeventfd.
 func getIoeventfdMMIOAddr() (uintptr, error) {
