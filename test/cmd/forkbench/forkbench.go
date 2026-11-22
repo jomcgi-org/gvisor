@@ -109,11 +109,18 @@ func baseConf() *config.Config {
 	return conf
 }
 
+// cgroupMount is where the unified cgroup hierarchy is mounted. ForkArgs.CgroupPath
+// is relative to it.
+const cgroupMount = "/sys/fs/cgroup"
+
 // childCgroup creates the cgroup for child id under -fb-cgroup-parent and
 // writes the requested limits. It returns "" when no cgroup parent is set.
 func childCgroup(id string) string {
 	if *fCgParent == "" {
 		return ""
+	}
+	if !strings.HasPrefix(*fCgParent, cgroupMount+"/") {
+		must(fmt.Errorf("%q is not under %s", *fCgParent, cgroupMount), "-fb-cgroup-parent")
 	}
 	dir := filepath.Join(*fCgParent, id)
 	must(os.Mkdir(dir, 0755), "mkdir cgroup "+dir)
@@ -323,7 +330,7 @@ func runRound(conf *config.Config, tmpl *container.Template, runDir string, n, r
 				Stdout:      out,
 				Stderr:      errf,
 				NetworkArgs: loopbackOnly(),
-				CgroupPath:  cgDirs[i],
+				CgroupPath:  strings.TrimPrefix(cgDirs[i], cgroupMount),
 			})
 			s.ForkAPIMS = ms(time.Since(t0))
 			if err != nil {

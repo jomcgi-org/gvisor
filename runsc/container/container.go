@@ -337,9 +337,13 @@ type ForkArgs struct {
 	// PIDFile is the filename where the forked sandbox pid will be written.
 	PIDFile string
 
-	// CgroupPath, if non-empty, must name an existing cgroupfs path. Fork moves
-	// the forked sandbox pid into it. If empty, the forked child inherits the
-	// sandbox template process cgroup.
+	// CgroupPath, if non-empty, must name an existing cgroup v2 directory,
+	// given relative to the cgroup mount point (for example "/pod/child" for
+	// /sys/fs/cgroup/pod/child), and the config must not set IgnoreCgroups. Fork
+	// moves the forked sandbox pid into it before the child starts the guest, so
+	// limits written there (pids.max, memory.max) apply from the first guest
+	// instruction. If empty, the forked child inherits the sandbox template
+	// process cgroup.
 	CgroupPath string
 
 	// BeforeStart, if non-nil, is called once the child process exists and is
