@@ -114,6 +114,12 @@ func (s *Server) serve() {
 	}
 }
 
+// RestrictMethods limits the server to the named methods until it is called
+// again without names. See urpc.Server.RestrictMethods.
+func (s *Server) RestrictMethods(names ...string) {
+	s.server.Load().RestrictMethods(names...)
+}
+
 // Register registers a specific control interface with the server.
 func (s *Server) Register(obj any) {
 	s.server.Load().Register(obj)

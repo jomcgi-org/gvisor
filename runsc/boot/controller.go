@@ -1076,6 +1076,9 @@ func (cm *containerManager) StartForked(args *sentryapi.CreateLinksAndRoutesArgs
 		return err
 	}
 
+	// The filter is on: serve the whole controller.
+	cm.l.ctrl.srv.RestrictMethods()
+
 	cm.l.watchdog.Start()
 	// Let the checkpoint read return "restore" when guest tasks resume.
 	cm.l.k.IncCheckpointGenOnRestore()
@@ -1253,6 +1256,10 @@ func (sc *SandboxTemplate) Fork(args *sentryapi.TemplateForkArgs, _ *sentryapi.T
 	if err := unix.Listen(l.ctrl.srv.FD(), 16 /* unet.backlog */); err != nil {
 		return fmt.Errorf("listening on forked control socket: %w", err)
 	}
+	// Until StartForked installs the Sentry seccomp filter, this process runs
+	// unfiltered. Serve only StartForked on the control socket meanwhile, so a
+	// peer that reaches the socket first cannot use the rest of the controller.
+	l.ctrl.srv.RestrictMethods(sentryapi.ContMgrStartForked)
 	l.ctrl.srv.StartServing()
 	return nil
 }
