@@ -1,0 +1,99 @@
+name: build-runsc (spike)
+
+"on":
+  workflow_dispatch:
+  push:
+    branches:
+      - spike/ci
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+    - name: Free runner disk
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h /
+
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Bazelisk
+      run: |
+        if ! command -v bazelisk >/dev/null; then
+          sudo curl -fsSL -o /usr/local/bin/bazelisk \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.26.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazelisk
+        fi
+        echo "bazel version file: $(cat .bazelversion)"
+        bazelisk version
+
+    - name: Build
+      run: |
+        set -euxo pipefail
+        # //:release lays out runsc, containerd-shim-runsc-v1 and gvisor-bin/
+        # (gvisor_sentry and the other sidecars) under bazel-bin/release/.
+        # container_test holds runsc/container/template_fork_test.go.
+        # template_fork_startup_benchmark_test holds the startup benchmark.
+        # Test binaries are built, not run.
+        bazelisk build \
+          --jobs=6 \
+          --disk_cache="$HOME/.cache/bazel-disk" \
+          --show_progress_rate_limit=30 \
+          //:release \
+          //runsc \
+          //runsc/cmd/sentry:gvisor_sentry \
+          //runsc/container:container_test \
+          //runsc/container:template_fork_startup_benchmark_test \
+          //runsc/container:template_fork_e2e_test \
+          //test/cmd/fork_ready \
+          //test/cmd/fork_state \
+          //test/cmd/test_app
+
+    - name: Stage artifacts
+      run: |
+        set -euxo pipefail
+        BB=$(bazelisk info bazel-bin)
+        mkdir -p out/release
+        cp -rL "$BB/release/." out/release/
+        # Test binaries with their runfiles (data deps incl. //:release), dereferenced.
+        for t in container_test template_fork_startup_benchmark_test template_fork_e2e_test; do
+          tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_" "$t.runfiles" 2>/dev/null \
+            || tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_"
+        done
+        tar -C out -czf out/runsc-release.tar.gz release
+        for b in fork_ready fork_state test_app; do
+          cp -L "$BB/test/cmd/$b/${b}_/$b" "out/$b"
+        done
+        cd out
+        ls -lh
+        sha256sum runsc-release.tar.gz *.runfiles.tar.gz fork_ready fork_state test_app > sha256sums.txt
+        (cd release && find . -type f -print0 | sort -z | xargs -0 sha256sum) > release-files.sha256
+        cat sha256sums.txt release-files.sha256
+
+    - name: Upload release binaries
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: runsc-release
+        path: |
+          out/runsc-release.tar.gz
+          out/release-files.sha256
+          out/sha256sums.txt
+          out/fork_ready
+          out/fork_state
+          out/test_app
+
+    - name: Upload test binaries
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: template-fork-tests
+        path: out/*.runfiles.tar.gz
