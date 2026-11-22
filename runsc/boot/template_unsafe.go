@@ -76,6 +76,14 @@ func preclone(pid int) {
 		panic(pid)
 	}
 	if pid != 0 {
+		if cloneCtx.finishProcessSetup {
+			// The reaper stub needs no capability and no descriptor.
+			if errno := dropStubPrivileges(); errno != 0 {
+				println("stub privilege drop errno:", errno)
+				syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 1, 0, 0)
+				panic("exit_group failed")
+			}
+		}
 		_execve(uintptr(unsafe.Pointer(cloneCtx.argv0)),
 			uintptr(unsafe.Pointer(&cloneCtx.argv[0])), 0)
 	}
@@ -84,6 +92,11 @@ func preclone(pid int) {
 	if cloneCtx.finishProcessSetup {
 		if errno := dropTemplateExecCaps(); errno != 0 {
 			println("template capability setup errno:", errno)
+			syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 1, 0, 0)
+			panic("exit_group failed")
+		}
+		if errno := reduceTemplateCaps(); errno != 0 {
+			println("template capability reduction errno:", errno)
 			syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 1, 0, 0)
 			panic("exit_group failed")
 		}
@@ -109,6 +122,15 @@ func templateReady() {
 	_close(cloneCtx.readyFD)
 	cloneCtx.readyFD = -1
 	_close(cloneCtx.loader.templateServerFD)
+	if cloneCtx.finishProcessSetup {
+		// The seed only waits for its workers from here on. The workers
+		// were cloned already and keep the capability they need to fork.
+		if errno := dropAllCaps(); errno != 0 {
+			println("seed capability drop errno:", errno)
+			syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 1, 0, 0)
+			panic("exit_group failed")
+		}
+	}
 }
 
 // waiting runs in each worker with the runtime still stopped. It blocks on
@@ -161,11 +183,80 @@ func postclone(pid int) {
 	}
 }
 
+// closeRangeCloexec is CLOSE_RANGE_CLOEXEC, which golang.org/x/sys/unix does
+// not define.
+const closeRangeCloexec = 1 << 2
+
 var (
 	forkProcPath  = [...]byte{'/', 'p', 'r', 'o', 'c', 0}
 	forkCapHeader = linux.CapUserHeader{Version: linux.LINUX_CAPABILITY_VERSION_3}
 	forkCapData   [2]linux.CapUserData
+
+	// templateCapData is the capability set the seed workers keep: only
+	// CAP_SYS_ADMIN, which each fork needs to create the child's namespaces and
+	// to unmount /proc in the child.
+	templateCapData = [2]linux.CapUserData{{
+		Effective: 1 << unix.CAP_SYS_ADMIN,
+		Permitted: 1 << unix.CAP_SYS_ADMIN,
+	}}
 )
+
+// dropAllCaps clears the effective, permitted and inheritable capability sets.
+//
+//go:nosplit
+func dropAllCaps() syscall.Errno {
+	_, _, errno := syscall.RawSyscall(unix.SYS_CAPSET, uintptr(unsafe.Pointer(&forkCapHeader)), uintptr(unsafe.Pointer(&forkCapData[0])), 0)
+	return errno
+}
+
+// reduceTemplateCaps drops every capability except CAP_SYS_ADMIN. It runs once
+// in the seed, after dropTemplateExecCaps used CAP_SETPCAP for the last time.
+// CAP_SYS_CHROOT was only needed to set up the chroot before the template
+// booted.
+//
+//go:nosplit
+func reduceTemplateCaps() syscall.Errno {
+	_, _, errno := syscall.RawSyscall(unix.SYS_CAPSET, uintptr(unsafe.Pointer(&forkCapHeader)), uintptr(unsafe.Pointer(&templateCapData[0])), 0)
+	return errno
+}
+
+// dropStubPrivileges runs in the template process just before it executes the
+// reaper stub. The stub only calls wait4, so it gets no capability, not even
+// the ambient ones that would survive the execve, and every descriptor except
+// the standard three closes at the execve.
+//
+//go:nosplit
+func dropStubPrivileges() syscall.Errno {
+	if _, _, errno := syscall.RawSyscall6(unix.SYS_PRCTL, unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0, 0); errno != 0 {
+		return errno
+	}
+	if errno := dropAllCaps(); errno != 0 {
+		return errno
+	}
+	_, _, errno := syscall.RawSyscall(unix.SYS_CLOSE_RANGE, 3, ^uintptr(0), closeRangeCloexec)
+	return errno
+}
+
+// forkNamespaceFlags returns the clone flags for the namespaces named by the
+// fork-namespaces setting.
+func forkNamespaceFlags(setting string) (int, error) {
+	list, err := config.ParseForkNamespaces(setting)
+	if err != nil {
+		return 0, err
+	}
+	var flags int
+	for _, ns := range list {
+		switch ns {
+		case config.ForkNamespaceIPC:
+			flags |= syscall.CLONE_NEWIPC
+		case config.ForkNamespaceNet:
+			flags |= syscall.CLONE_NEWNET
+		case config.ForkNamespaceCgroup:
+			flags |= unix.CLONE_NEWCGROUP
+		}
+	}
+	return flags, nil
+}
 
 // dropTemplateExecCaps clears capability sets used by exec once, so children
 // inherit them empty. The template keeps its effective capabilities to create
@@ -194,27 +285,6 @@ func finishForkProcessSetup() syscall.Errno {
 	}
 	_, _, errno := syscall.RawSyscall(unix.SYS_CAPSET, uintptr(unsafe.Pointer(&forkCapHeader)), uintptr(unsafe.Pointer(&forkCapData[0])), 0)
 	return errno
-}
-
-// forkNamespaceFlags returns the clone flags for the namespaces named by the
-// fork-namespaces setting.
-func forkNamespaceFlags(setting string) (int, error) {
-	list, err := config.ParseForkNamespaces(setting)
-	if err != nil {
-		return 0, err
-	}
-	var flags int
-	for _, ns := range list {
-		switch ns {
-		case config.ForkNamespaceIPC:
-			flags |= syscall.CLONE_NEWIPC
-		case config.ForkNamespaceNet:
-			flags |= syscall.CLONE_NEWNET
-		case config.ForkNamespaceCgroup:
-			flags |= unix.CLONE_NEWCGROUP
-		}
-	}
-	return flags, nil
 }
 
 // clone fires runtime.Clone with the template's CLONE_NEW{NS,UTS,PID} flags
