@@ -342,6 +342,11 @@ type ForkArgs struct {
 	// sandbox template process cgroup.
 	CgroupPath string
 
+	// BeforeStart, if non-nil, is called once the child process exists and is
+	// in its cgroup, before it installs its Sentry seccomp filter and starts
+	// the guest. It exists for tests of that window.
+	BeforeStart func() error
+
 	// Stdout and Stderr are donated to the forked child as its root stdio.
 	// They must be writable regular files opened with O_APPEND. If nil,
 	// os.Stdout and os.Stderr are used and must satisfy the same constraints.
@@ -636,7 +641,13 @@ func (t *Template) Fork(conf *config.Config, args ForkArgs) (*Container, error) 
 		BackendFiles: backendFiles,
 		BeforeStart: func() error {
 			c.changeStatus(Created)
-			return c.saveLocked()
+			if err := c.saveLocked(); err != nil {
+				return err
+			}
+			if args.BeforeStart != nil {
+				return args.BeforeStart()
+			}
+			return nil
 		},
 	}); err != nil {
 		return nil, err

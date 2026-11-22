@@ -1447,3 +1447,143 @@ func lifecycleFork(t *testing.T, tmpl *Template, conf *config.Config, args ForkA
 	waitForFileLine(t, args.Stdout.Name(), "READY", 10*time.Second)
 	return child
 }
+
+// kcmpSameFile reports whether fd1 of pid1 and fd2 of pid2 are the same open
+// file description (KCMP_FILE). It needs CAP_SYS_PTRACE.
+func kcmpSameFile(pid1, pid2, fd1, fd2 int) bool {
+	const kcmpFile = 0
+	r, _, errno := unix.Syscall6(unix.SYS_KCMP, uintptr(pid1), uintptr(pid2), kcmpFile, uintptr(fd1), uintptr(fd2), 0)
+	return errno == 0 && r == 0
+}
+
+// fdAccessMode returns the access mode (O_RDONLY, O_WRONLY or O_RDWR) of fd in pid.
+func fdAccessMode(t *testing.T, pid int, fd string) int {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/fdinfo/%s", pid, fd))
+	if err != nil {
+		return -1 // The descriptor closed meanwhile.
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "flags:"); ok {
+			flags, err := strconv.ParseUint(strings.TrimSpace(rest), 8, 32)
+			if err != nil {
+				t.Fatalf("parsing flags %q: %v", line, err)
+			}
+			return int(flags) & unix.O_ACCMODE
+		}
+	}
+	return -1
+}
+
+// TestTemplateForkNoSharedWritableDescriptors checks that no forked child shares
+// a writable open file description with a sibling or with the template worker.
+// Read-only descriptors, such as the EROFS root image, may be shared, and so
+// may /dev/null.
+func TestTemplateForkNoSharedWritableDescriptors(t *testing.T) {
+	tmpl, conf := newLifecycleTemplate(t, 1)
+	a := lifecycleFork(t, tmpl, conf, lifecycleForkArgs(t))
+	b := lifecycleFork(t, tmpl, conf, lifecycleForkArgs(t))
+	procs := []struct {
+		name string
+		pid  int
+	}{
+		{"child A", a.Sandbox.Getpid()},
+		{"child B", b.Sandbox.Getpid()},
+		{"worker", workerParentPID(t, a.SandboxPid())},
+	}
+	fdsOf := func(pid int) []string {
+		entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fds []string
+		for _, e := range entries {
+			fds = append(fds, e.Name())
+		}
+		return fds
+	}
+	for i := range procs {
+		for j := i + 1; j < len(procs); j++ {
+			x, y := procs[i], procs[j]
+			for _, fx := range fdsOf(x.pid) {
+				for _, fy := range fdsOf(y.pid) {
+					nx, _ := strconv.Atoi(fx)
+					ny, _ := strconv.Atoi(fy)
+					if !kcmpSameFile(x.pid, y.pid, nx, ny) {
+						continue
+					}
+					target, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", x.pid, fx))
+					if err != nil || target == "/dev/null" {
+						continue
+					}
+					if fdAccessMode(t, x.pid, fx) != unix.O_RDONLY || fdAccessMode(t, y.pid, fy) != unix.O_RDONLY {
+						t.Errorf("%s fd %s and %s fd %s share the writable open file description %q", x.name, fx, y.name, fy, target)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestTemplateForkNamespaces checks which host namespaces a forked child has of
+// its own.
+func TestTemplateForkNamespaces(t *testing.T) {
+	tmpl, conf := newLifecycleTemplate(t, 1)
+	a := lifecycleFork(t, tmpl, conf, lifecycleForkArgs(t))
+	b := lifecycleFork(t, tmpl, conf, lifecycleForkArgs(t))
+	worker := workerParentPID(t, a.SandboxPid())
+	ns := func(pid int, name string) string {
+		t.Helper()
+		link, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/%s", pid, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return link
+	}
+	want := map[string]bool{"mnt": true, "uts": true, "pid": true}
+	extra, err := config.ParseForkNamespaces(conf.ForkNamespaces)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range extra {
+		want[string(e)] = true
+	}
+	for _, name := range []string{"mnt", "uts", "pid", "ipc", "net", "cgroup"} {
+		own := ns(a.Sandbox.Getpid(), name) != ns(worker, name) && ns(a.Sandbox.Getpid(), name) != ns(b.Sandbox.Getpid(), name)
+		if own != want[name] {
+			t.Errorf("%s namespace: child has its own = %v, want %v", name, own, want[name])
+		}
+	}
+}
+
+// TestTemplateForkControlSurfaceBeforeStart checks that a forked child, which
+// runs without the Sentry seccomp filter until StartForked, serves only
+// StartForked on its control socket until then.
+func TestTemplateForkControlSurfaceBeforeStart(t *testing.T) {
+	tmpl, conf := newLifecycleTemplate(t, 1)
+	args := lifecycleForkArgs(t)
+	var beforeErr error
+	called := false
+	args.BeforeStart = func() error {
+		called = true
+		c, err := connectSandboxTemplateSocket(filepath.Join(conf.RootDir, "runsc-"+args.ID+".sock"))
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		cid := args.ID
+		var out any
+		beforeErr = c.Call(sentryapi.ContMgrProcesses, &cid, &out)
+		return nil
+	}
+	child := lifecycleFork(t, tmpl, conf, args)
+	if !called {
+		t.Fatal("BeforeStart was not called")
+	}
+	if beforeErr == nil || !strings.Contains(beforeErr.Error(), urpc.ErrUnknownMethod.Error()) {
+		t.Errorf("Processes before StartForked: err = %v, want %q", beforeErr, urpc.ErrUnknownMethod)
+	}
+	if _, err := child.Processes(); err != nil {
+		t.Errorf("Processes after StartForked: %v", err)
+	}
+}
