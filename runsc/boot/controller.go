@@ -1237,6 +1237,9 @@ func (sc *SandboxTemplate) Fork(args *sentryapi.TemplateForkArgs, _ *sentryapi.T
 	}
 	files := args.Files
 	l := sc.loader
+	if err := resetInheritedForkState(l); err != nil {
+		return err
+	}
 	if err := l.k.UpdateMemoryFileFilestore(backendFiles); err != nil {
 		return fmt.Errorf("updating memory file filestore: %w", err)
 	}

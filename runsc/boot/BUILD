@@ -30,6 +30,7 @@ go_library(
         "seccheck.go",
         "seccomp.go",
         "strace.go",
+        "template_isolation.go",
         "template_unsafe.go",
         "tpuproxy.go",
         "vfs.go",
