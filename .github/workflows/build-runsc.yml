@@ -40,6 +40,9 @@ jobs:
     - name: Build
       run: |
         set -euxo pipefail
+        # The disk cleanup removed the Android SDK that these variables still
+        # name, and rules_android's repository rule fails on it.
+        unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME
         # //:release lays out runsc, containerd-shim-runsc-v1 and gvisor-bin/
         # (gvisor_sentry and the other sidecars) under bazel-bin/release/.
         # container_test holds runsc/container/template_fork_test.go.
