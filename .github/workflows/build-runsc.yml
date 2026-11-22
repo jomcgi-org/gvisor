@@ -89,6 +89,7 @@ jobs:
           //runsc/container:container_test \
           //runsc/container:template_fork_startup_benchmark_test \
           //runsc/container:template_fork_e2e_test \
+          //runsc/container:template_fork_semgrep_net_test \
           //test/cmd/forkbench \
           //test/cmd/fork_ready \
           //test/cmd/fork_state \
@@ -108,7 +109,7 @@ jobs:
         mkdir -p out/release
         cp -rL "$BB/release/." out/release/
         # Test binaries with their runfiles (data deps incl. //:release), dereferenced.
-        for t in container_test template_fork_startup_benchmark_test template_fork_e2e_test; do
+        for t in container_test template_fork_startup_benchmark_test template_fork_e2e_test template_fork_semgrep_net_test; do
           tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_" "$t.runfiles" 2>/dev/null \
             || tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_"
         done
