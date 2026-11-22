@@ -46,6 +46,18 @@ jobs:
         echo "bazel version file: $(cat .bazelversion)"
         bazelisk version
 
+    - name: Diagnose C toolchain
+      continue-on-error: true
+      run: |
+        set +e
+        x86_64-linux-gnu-gcc --version | head -1
+        x86_64-linux-gnu-gcc -print-prog-name=ld
+        ls -l /usr/bin/ld* /usr/bin/x86_64-linux-gnu-ld* /usr/lib/gold-ld 2>&1 | grep -v ldap
+        echo 'int main(void){return 0;}' > /tmp/t.c
+        x86_64-linux-gnu-gcc -static -fuse-ld=gold /tmp/t.c -o /tmp/t-gold; echo "gold rc=$?"
+        x86_64-linux-gnu-gcc -static /tmp/t.c -o /tmp/t-default; echo "default rc=$?"
+        dpkg -l | grep -E 'binutils|gcc-x86-64|crossbuild' | awk '{print $2, $3}'
+
     - name: Restore Bazel disk cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -66,6 +78,8 @@ jobs:
         # Test binaries are built, not run.
         bazelisk build \
           --jobs=6 \
+          --keep_going \
+          --verbose_failures \
           --disk_cache="$HOME/.cache/bazel-disk" \
           --show_progress_rate_limit=30 \
           //:release \
