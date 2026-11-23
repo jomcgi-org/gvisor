@@ -137,6 +137,11 @@ func (r *GVisorRuntime) CreateTemplate(ts TemplateSpec) (Template, error) {
 			sentryapi.RootfsPrefix + "overlay": config.NoOverlay.String(),
 		},
 	}
+	if ts.CgroupPath != "" {
+		// runsc keeps the limits of a cgroup that already exists and sizes the
+		// guest's memory from its memory.max.
+		spec.Linux = &specs.Linux{CgroupsPath: ts.CgroupPath}
+	}
 	if !ts.DropCapabilities {
 		spec.Process.Capabilities = specutils.AllCapabilities()
 	}

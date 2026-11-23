@@ -34,6 +34,9 @@ type seed struct {
 	// was hashed.
 	image *os.File
 
+	// cg is the seed's cgroup leaf, nil without a cgroup parent.
+	cg *childCgroup
+
 	mu       sync.Mutex
 	info     SeedInfo
 	creating bool
@@ -50,6 +53,9 @@ func (sd *seed) snapshot() SeedInfo {
 	defer sd.mu.Unlock()
 	info := sd.info
 	info.Children = len(sd.children)
+	if sd.cg != nil {
+		info.OOMKills = sd.cg.oomKills()
+	}
 	if sd.dead {
 		info.State = "dead"
 	}
@@ -85,6 +91,14 @@ func (s *Server) validateSeed(req *SeedRequest) *opError {
 	}
 	if req.CPUs < 0 || req.CPUs > 64 {
 		return errf(CodeInvalidArgument, "cpus must be between 0 and 64")
+	}
+	// Without a cgroup parent there is nothing to limit with. Startup already
+	// refused that unless unlimited children are allowed.
+	if err := req.Cgroup.validateSeed(s.cg != nil && !s.opt.AllowUnlimitedChildren); err != nil {
+		return errf(CodeInvalidArgument, "cgroup: %v", err)
+	}
+	if req.Cgroup != nil && s.cg == nil {
+		return errf(CodeFailedPrecondition, "cgroup limits need forkd to run with --cgroup-parent")
 	}
 	seen := map[string]bool{}
 	for _, t := range req.Tmpfs {
@@ -150,6 +164,16 @@ func (s *Server) doSeed(req *SeedRequest) (*SeedInfo, *opError) {
 		return fail(errf(CodeInternal, "%v", err))
 	}
 
+	// The leaf exists, with its limits, before the template boots: runsc puts
+	// the template's processes into it when it creates them.
+	cgroupPath := ""
+	if s.cg != nil {
+		if sd.cg, err = s.cg.createSeed(req.SeedID, req.Cgroup); err != nil {
+			return fail(errf(CodeInternal, "%v", err))
+		}
+		cgroupPath = sd.cg.relative()
+	}
+
 	workers, cpus := req.Workers, req.CPUs
 	if workers == 0 {
 		workers = 1
@@ -162,6 +186,7 @@ func (s *Server) doSeed(req *SeedRequest) (*SeedInfo, *opError) {
 		ID:               req.SeedID,
 		Dir:              sd.dir,
 		ImagePath:        fmt.Sprintf("/proc/self/fd/%d", sd.image.Fd()),
+		CgroupPath:       cgroupPath,
 		Args:             req.Args,
 		Env:              req.Env,
 		Cwd:              req.Cwd,
@@ -183,7 +208,7 @@ func (s *Server) doSeed(req *SeedRequest) (*SeedInfo, *opError) {
 	var attestation []string
 	if !s.opt.skipAttestation {
 		var aerr error
-		attestation, aerr = attestSeed(tmpl.PID())
+		attestation, aerr = attestSeed(tmpl.PID(), sd.cg)
 		if aerr != nil {
 			_ = tmpl.Destroy()
 			return fail(errf(CodeFailedPrecondition, "%v", aerr))
@@ -204,6 +229,9 @@ func (s *Server) doSeed(req *SeedRequest) (*SeedInfo, *opError) {
 		CreatedUnix: time.Now().UnixMilli(),
 		Attestation: attestation,
 	}
+	if sd.cg != nil {
+		sd.info.CgroupPath = sd.cg.dir
+	}
 	sd.mu.Unlock()
 	go s.watchSeed(sd)
 	info := sd.snapshot()
@@ -217,6 +245,7 @@ func (sd *seed) release() {
 			f.Close()
 		}
 	}
+	sd.cg.remove()
 	if sd.dir != "" {
 		os.RemoveAll(sd.dir)
 	}

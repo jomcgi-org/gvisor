@@ -54,6 +54,14 @@ func (r *fakeRuntime) CreateTemplate(ts TemplateSpec) (Template, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
+	if ts.CgroupPath != "" {
+		procs := filepath.Join(cgroupMount, ts.CgroupPath, "cgroup.procs")
+		if err := os.WriteFile(procs, []byte(strconv.Itoa(cmd.Process.Pid)), 0644); err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			return nil, err
+		}
+	}
 	t := &fakeTemplate{rt: r, spec: ts, cmd: cmd}
 	go cmd.Wait()
 	r.mu.Lock()

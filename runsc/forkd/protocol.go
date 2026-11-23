@@ -39,7 +39,11 @@ import (
 
 // ProtocolVersion is the version of the wire protocol that this package
 // speaks.
-const ProtocolVersion = 1
+//
+// Version 2: a seed request carries the cgroup that limits the seed, and a
+// cgroup of a seed or child must set memory_max (memory_high alone only
+// throttles a cgroup, it never kills it).
+const ProtocolVersion = 2
 
 // MaxFrameBytes bounds one message. Requests carry identities, limits and
 // environment entries, never request bodies.
@@ -160,6 +164,13 @@ type SeedRequest struct {
 	// the child that writes them.
 	Tmpfs []Tmpfs `json:"tmpfs,omitempty"`
 
+	// Cgroup limits the seed: the template's processes run in a cgroup of their
+	// own below forkd's cgroup parent from their first instruction. The pages
+	// that children share with the seed are charged to it. MemoryMax is
+	// required, unless forkd runs with --forkd-allow-unlimited-children. The
+	// guest sees MemoryMax as its total memory.
+	Cgroup *Cgroup `json:"cgroup,omitempty"`
+
 	// Workers is the number of template worker processes that serve forks.
 	// Zero means one. A worker that dies ends the seed and all its children.
 	Workers int `json:"workers,omitempty"`
@@ -203,10 +214,14 @@ type ForkRequest struct {
 type Cgroup struct {
 	// CPUMax is the cpu.max value, "<quota> <period>" in microseconds, or "max".
 	CPUMax string `json:"cpu_max,omitempty"`
-	// MemoryHigh and MemoryMax are bytes. Swap is always disabled.
+	// MemoryMax is the limit in bytes at which the kernel kills the cgroup's
+	// processes. It is required. MemoryHigh is an optional soft limit below it:
+	// a cgroup above memory.high is throttled and never killed. Swap is always
+	// disabled.
 	MemoryHigh int64 `json:"memory_high,omitempty"`
 	MemoryMax  int64 `json:"memory_max,omitempty"`
-	// PidsMax bounds the processes and threads of the child's sandbox.
+	// PidsMax bounds the processes and threads of the sandbox. It is required
+	// for a child.
 	PidsMax int64 `json:"pids_max,omitempty"`
 }
 
@@ -279,6 +294,10 @@ type SeedInfo struct {
 	ReadyMS     int64  `json:"ready_ms"`
 	CreatedUnix int64  `json:"created_unix_ms"`
 	Children    int    `json:"children"`
+	// CgroupPath is the absolute path of the seed's cgroup, if it has one.
+	CgroupPath string `json:"cgroup_path,omitempty"`
+	// OOMKills is the oom_kill counter of the seed's cgroup.
+	OOMKills int64 `json:"oom_kills,omitempty"`
 	// Attestation is what forkd read from /proc about the seed's processes.
 	Attestation []string `json:"attestation,omitempty"`
 }

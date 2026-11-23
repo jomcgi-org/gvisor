@@ -179,7 +179,7 @@ func TestAttestRefusesUnconfinedProcesses(t *testing.T) {
 	// A seed process with capabilities besides CAP_SYS_ADMIN is refused, but
 	// only when the test runs with some.
 	if st, err := readProcStatus(os.Getpid()); err == nil && (st.CapEff|st.CapPrm|st.CapAmb)&^capBit(capSysAdmin) != 0 {
-		if _, err := attestSeed(os.Getpid()); err == nil {
+		if _, err := attestSeed(os.Getpid(), nil); err == nil {
 			t.Error("attestSeed accepted a process with extra capabilities")
 		}
 	}
@@ -275,7 +275,11 @@ func newEnv(t *testing.T, mutate func(*Options)) *testEnv {
 func (e *testEnv) seed(id string) *SeedInfo {
 	e.t.Helper()
 	path, digest := writeImage(e.t, e.dir, "rootfs "+id, 0444)
-	info, err := e.client.Seed(&SeedRequest{SeedID: id, Image: path, ImageSHA256: digest, Args: []string{"/app"}, Tmpfs: []Tmpfs{{Path: "/tmp", SizeBytes: 1 << 20}}})
+	req := &SeedRequest{SeedID: id, Image: path, ImageSHA256: digest, Args: []string{"/app"}, Tmpfs: []Tmpfs{{Path: "/tmp", SizeBytes: 1 << 20}}}
+	if e.srv.cg != nil {
+		req.Cgroup = &Cgroup{MemoryMax: 256 << 20}
+	}
+	info, err := e.client.Seed(req)
 	if err != nil {
 		e.t.Fatalf("Seed: %v", err)
 	}
@@ -435,6 +439,7 @@ func TestForkLimitsAreRequired(t *testing.T) {
 	for name, cg := range map[string]*Cgroup{
 		"no pids":        {MemoryMax: 1 << 28},
 		"no memory":      {PidsMax: 64},
+		"high only":      {PidsMax: 64, MemoryHigh: 1 << 20},
 		"high above max": {PidsMax: 64, MemoryHigh: 2 << 20, MemoryMax: 1 << 20},
 		"negative":       {PidsMax: -1, MemoryMax: 1},
 		"bad cpu":        {PidsMax: 64, MemoryMax: 1 << 20, CPUMax: "fast"},
@@ -445,6 +450,28 @@ func TestForkLimitsAreRequired(t *testing.T) {
 	}
 	if err := (&Cgroup{PidsMax: 64, MemoryHigh: 1 << 20, MemoryMax: 2 << 20, CPUMax: "50000 100000"}).validate(true); err != nil {
 		t.Errorf("validate rejected good limits: %v", err)
+	}
+}
+
+func TestSeedLimitsAreChecked(t *testing.T) {
+	for name, cg := range map[string]*Cgroup{
+		"no cgroup":      nil,
+		"no memory":      {PidsMax: 64},
+		"high only":      {MemoryHigh: 1 << 20},
+		"high above max": {MemoryHigh: 2 << 20, MemoryMax: 1 << 20},
+		"negative":       {MemoryMax: -1},
+		"bad cpu":        {MemoryMax: 1 << 20, CPUMax: "fast"},
+	} {
+		if err := cg.validateSeed(true); err == nil {
+			t.Errorf("%s: validateSeed accepted %+v", name, cg)
+		}
+	}
+	// A seed needs no pids_max.
+	if err := (&Cgroup{MemoryMax: 1 << 30}).validateSeed(true); err != nil {
+		t.Errorf("validateSeed rejected a memory limit: %v", err)
+	}
+	if err := (*Cgroup)(nil).validateSeed(false); err != nil {
+		t.Errorf("validateSeed(false) rejected no cgroup: %v", err)
 	}
 }
 
@@ -701,6 +728,72 @@ func TestChildCgroupLimits(t *testing.T) {
 	}
 	if _, err := os.Stat(info.CgroupPath); !os.IsNotExist(err) {
 		t.Errorf("the cgroup leaf remains after the child is deleted: %v", err)
+	}
+}
+
+func TestSeedCgroupLimits(t *testing.T) {
+	parent := cgroup2Writable(t)
+	e := newEnv(t, func(o *Options) {
+		o.AllowUnlimitedChildren = false
+		o.Settings.CgroupParentDir = parent
+	})
+	path, digest := writeImage(t, e.dir, "rootfs seed", 0444)
+	req := &SeedRequest{SeedID: "s", Image: path, ImageSHA256: digest, Args: []string{"/app"}}
+	// The limit is required once forkd has a cgroup parent.
+	if _, err := e.client.Seed(req); codeOf(err) != CodeInvalidArgument {
+		t.Fatalf("Seed without a cgroup = %v, want invalid_argument", err)
+	}
+	req.Cgroup = &Cgroup{MemoryHigh: 100 << 20}
+	if _, err := e.client.Seed(req); codeOf(err) != CodeInvalidArgument {
+		t.Fatalf("Seed with memory_high only = %v, want invalid_argument", err)
+	}
+	req.Cgroup = &Cgroup{MemoryMax: 128 << 20, PidsMax: 200}
+	info, err := e.client.Seed(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(parent, seedLeafPrefix+"s")
+	if info.CgroupPath != want {
+		t.Fatalf("seed cgroup path = %q, want %q", info.CgroupPath, want)
+	}
+	read := func(name string) string {
+		b, err := os.ReadFile(filepath.Join(want, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	for name, w := range map[string]string{"memory.max": fmt.Sprint(128 << 20), "pids.max": "200", "memory.swap.max": "0"} {
+		if got := read(name); got != w {
+			t.Errorf("%s = %q, want %q", name, got, w)
+		}
+	}
+	if procs := read("cgroup.procs"); procs != fmt.Sprint(info.PID) {
+		t.Errorf("cgroup.procs = %q, want the template %d", procs, info.PID)
+	}
+	// A child's own leaf is a sibling, never inside the seed's.
+	child, err := e.client.Fork(&ForkRequest{SeedID: "s", ChildID: "c1", Cgroup: &Cgroup{PidsMax: 64, MemoryMax: 64 << 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(child.CgroupPath) != parent {
+		t.Errorf("child cgroup %q is not a sibling of the seed's", child.CgroupPath)
+	}
+	// A second seed with the same id fails and leaves the first one's leaf.
+	if _, err := e.client.Seed(req); codeOf(err) != CodeAlreadyExists {
+		t.Errorf("duplicate Seed = %v, want already_exists", err)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Errorf("the seed's leaf disappeared: %v", err)
+	}
+	if err := e.client.DeleteSeed("s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Errorf("the seed's leaf remains after the seed is deleted: %v", err)
+	}
+	if _, err := os.Stat(child.CgroupPath); !os.IsNotExist(err) {
+		t.Errorf("the child's leaf remains after its seed is deleted: %v", err)
 	}
 }
 

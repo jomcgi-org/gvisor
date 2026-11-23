@@ -88,25 +88,48 @@ func validCPUMax(s string) bool {
 	return true
 }
 
-// validate checks the limits without touching the host.
+// validate checks the limits of a child without touching the host. A child
+// needs pids_max and memory_max when limits are required.
 func (c *Cgroup) validate(requireLimits bool) error {
+	if err := c.validateLimits(requireLimits); err != nil {
+		return err
+	}
+	if requireLimits && c.PidsMax == 0 {
+		return fmt.Errorf("a cgroup with pids_max and memory_max is required")
+	}
+	return nil
+}
+
+// validateSeed checks the limits of a seed. It needs memory_max when limits
+// are required, and no pids_max.
+func (c *Cgroup) validateSeed(requireLimits bool) error {
+	return c.validateLimits(requireLimits)
+}
+
+// validateLimits checks what a seed and a child have in common. memory_high
+// only throttles a cgroup that has reached it, so a cgroup with no memory_max
+// is not limited.
+func (c *Cgroup) validateLimits(requireLimits bool) error {
 	if c == nil {
 		if requireLimits {
-			return fmt.Errorf("a cgroup with pids_max and a memory limit is required")
+			return fmt.Errorf("a cgroup with memory_max is required")
 		}
 		return nil
 	}
 	if c.MemoryHigh < 0 || c.MemoryMax < 0 || c.PidsMax < 0 {
 		return fmt.Errorf("cgroup limits must not be negative")
 	}
-	if c.MemoryHigh > 0 && c.MemoryMax > 0 && c.MemoryHigh > c.MemoryMax {
+	if c.MemoryHigh > 0 && c.MemoryMax == 0 {
+		return fmt.Errorf("memory_high without memory_max only throttles the cgroup, it never kills it: set memory_max")
+	}
+	if c.MemoryHigh > 0 && c.MemoryHigh > c.MemoryMax {
 		return fmt.Errorf("memory_high %d is above memory_max %d", c.MemoryHigh, c.MemoryMax)
 	}
 	if c.CPUMax != "" && !validCPUMax(c.CPUMax) {
 		return fmt.Errorf("invalid cpu_max %q", c.CPUMax)
 	}
-	if requireLimits && (c.PidsMax == 0 || (c.MemoryHigh == 0 && c.MemoryMax == 0)) {
-		return fmt.Errorf("a cgroup with pids_max and a memory limit is required")
+	if requireLimits && c.MemoryMax == 0 {
+		return fmt.Errorf("a cgroup with memory_max is required")
 	}
 	return nil
 }
@@ -122,7 +145,23 @@ func (p *cgroupParent) create(id string, c *Cgroup) (*childCgroup, error) {
 	if err := ValidID(id); err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(p.dir, id)
+	return p.leaf(id, c)
+}
+
+// seedLeafPrefix starts the name of a seed's leaf. A child id cannot start
+// with it, so a seed and a child never share a name.
+const seedLeafPrefix = "_seed."
+
+// createSeed makes the leaf of a seed.
+func (p *cgroupParent) createSeed(id string, c *Cgroup) (*childCgroup, error) {
+	if err := ValidID(id); err != nil {
+		return nil, err
+	}
+	return p.leaf(seedLeafPrefix+id, c)
+}
+
+func (p *cgroupParent) leaf(name string, c *Cgroup) (*childCgroup, error) {
+	dir := filepath.Join(p.dir, name)
 	if err := os.Mkdir(dir, 0755); err != nil {
 		return nil, fmt.Errorf("creating cgroup %q: %w", dir, err)
 	}
@@ -172,6 +211,16 @@ func (p *cgroupParent) create(id string, c *Cgroup) (*childCgroup, error) {
 // relative is the path that the runtime takes: relative to the mount.
 func (c *childCgroup) relative() string {
 	return strings.TrimPrefix(c.dir, cgroupMount)
+}
+
+// read returns the trimmed content of a file of the leaf, "" if it cannot be
+// read.
+func (c *childCgroup) read(file string) string {
+	data, err := os.ReadFile(filepath.Join(c.dir, file))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }
 
 // oomKills reads the oom_kill counter of the leaf.

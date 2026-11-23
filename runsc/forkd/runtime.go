@@ -37,6 +37,11 @@ type TemplateSpec struct {
 	// ImagePath is a path that opens the verified image, such as
 	// /proc/self/fd/N.
 	ImagePath string
+	// CgroupPath is an existing cgroup v2 directory, relative to the cgroup
+	// mount, that the template's processes run in. forkd made it and set its
+	// limits, so the runtime must not change them. Empty means the runtime's
+	// default cgroup.
+	CgroupPath string
 
 	Args             []string
 	Env              []string

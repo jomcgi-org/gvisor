@@ -303,9 +303,14 @@ func descendants(root int) []int {
 // attestSeed checks the privileges of every process of a booted seed: the stub,
 // the seed and its workers may hold at most CAP_SYS_ADMIN, which the workers
 // need to clone children into new namespaces. It returns what it read.
-func attestSeed(templatePID int) (lines []string, err error) {
+func attestSeed(templatePID int, cg *childCgroup) (lines []string, err error) {
 	var bad []string
 	for _, pid := range descendants(templatePID) {
+		if cg != nil {
+			if got := cgroupOf(pid); got != cg.relative() {
+				bad = append(bad, fmt.Sprintf("pid %d is in cgroup %q, not in the seed's %q", pid, got, cg.relative()))
+			}
+		}
 		st, rerr := readProcStatus(pid)
 		if rerr != nil {
 			continue // exited meanwhile
@@ -315,10 +320,27 @@ func attestSeed(templatePID int) (lines []string, err error) {
 			bad = append(bad, fmt.Sprintf("pid %d holds capabilities %#x besides CAP_SYS_ADMIN", pid, extra))
 		}
 	}
+	if cg != nil {
+		lines = append(lines, fmt.Sprintf("cgroup=%s memory.max=%s pids.max=%s", cg.relative(), cg.read("memory.max"), cg.read("pids.max")))
+	}
 	if len(bad) > 0 {
 		return lines, fmt.Errorf("seed privileges: %s", strings.Join(bad, "; "))
 	}
 	return lines, nil
+}
+
+// cgroupOf is the cgroup v2 path of a process, "" if it cannot be read.
+func cgroupOf(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if path, ok := strings.CutPrefix(line, "0::"); ok {
+			return path
+		}
+	}
+	return ""
 }
 
 // namespaces are the links in /proc/<pid>/ns that a child must not share with

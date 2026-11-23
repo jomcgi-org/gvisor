@@ -205,14 +205,19 @@ func (d *daemon) dial() *forkd.Client {
 
 var limits = &forkd.Cgroup{PidsMax: 64, MemoryHigh: 192 << 20, MemoryMax: 256 << 20}
 
+// seedLimits is the cgroup of a seed. The guest sees its memory.max as its
+// total memory.
+var seedLimits = &forkd.Cgroup{MemoryMax: 1 << 30}
+
 func seedBusybox(t *testing.T, c *forkd.Client, id string) *forkd.SeedInfo {
 	t.Helper()
 	image, digest := buildBusyboxImage(t, t.TempDir())
 	info, err := c.Seed(&forkd.SeedRequest{
 		SeedID: id, Image: image, ImageSHA256: digest,
-		Args:  []string{"/busybox", "sh", "-c", guest},
-		Env:   []string{"PATH=/"},
-		Tmpfs: []forkd.Tmpfs{{Path: "/tmp", SizeBytes: 512 << 20}},
+		Args:   []string{"/busybox", "sh", "-c", guest},
+		Env:    []string{"PATH=/"},
+		Tmpfs:  []forkd.Tmpfs{{Path: "/tmp", SizeBytes: 512 << 20}},
+		Cgroup: seedLimits,
 	})
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
@@ -308,7 +313,7 @@ func TestForkdLifecycle(t *testing.T) {
 
 	// A seed with the wrong digest does not boot.
 	image, digest := buildBusyboxImage(t, t.TempDir())
-	if _, err := c.Seed(&forkd.SeedRequest{SeedID: "bad", Image: image, ImageSHA256: strings.Repeat("a", 64), Args: []string{"/busybox", "true"}}); err == nil || !strings.Contains(err.Error(), forkd.CodePermissionDenied) {
+	if _, err := c.Seed(&forkd.SeedRequest{SeedID: "bad", Image: image, ImageSHA256: strings.Repeat("a", 64), Args: []string{"/busybox", "true"}, Cgroup: seedLimits}); err == nil || !strings.Contains(err.Error(), forkd.CodePermissionDenied) {
 		t.Errorf("Seed with a wrong digest = %v, want permission_denied", err)
 	}
 	_ = digest
@@ -462,6 +467,91 @@ func TestForkdNetworkPerChild(t *testing.T) {
 	}
 }
 
+// TestForkdSeedCgroup checks that the seed's processes run in the capped cgroup
+// from the start, that the cap is a real limit, and that children do not run
+// in the seed's cgroup.
+func TestForkdSeedCgroup(t *testing.T) {
+	needsHost(t)
+	d := startForkd(t)
+	c := d.dial()
+	image, digest := buildBusyboxImage(t, t.TempDir())
+	req := func(id string, cg *forkd.Cgroup) *forkd.SeedRequest {
+		return &forkd.SeedRequest{SeedID: id, Image: image, ImageSHA256: digest,
+			Args: []string{"/busybox", "sh", "-c", guest}, Env: []string{"PATH=/"},
+			Tmpfs: []forkd.Tmpfs{{Path: "/tmp", SizeBytes: 64 << 20}}, Cgroup: cg}
+	}
+
+	// A seed without a limit is refused: forkd runs with a cgroup parent.
+	if _, err := c.Seed(req("nolimit", nil)); err == nil || !strings.Contains(err.Error(), forkd.CodeInvalidArgument) {
+		t.Errorf("Seed with no cgroup = %v, want invalid_argument", err)
+	}
+
+	read := func(dir, name string) string {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(string(b))
+	}
+	seed, err := c.Seed(req("capped", &forkd.Cgroup{MemoryMax: 512 << 20, PidsMax: 512}))
+	if err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	if want := filepath.Join(d.parent, "_seed.capped"); seed.CgroupPath != want {
+		t.Fatalf("seed cgroup = %q, want %q", seed.CgroupPath, want)
+	}
+	for name, want := range map[string]string{"memory.max": fmt.Sprint(512 << 20), "pids.max": "512", "memory.swap.max": "0"} {
+		if got := read(seed.CgroupPath, name); got != want {
+			t.Errorf("seed %s = %q, want %q", name, got, want)
+		}
+	}
+	// Every process of the template tree is in the leaf, and charged to it.
+	procs := strings.Fields(read(seed.CgroupPath, "cgroup.procs"))
+	if len(procs) < 2 {
+		t.Errorf("the seed cgroup holds %d processes %v, want the template tree", len(procs), procs)
+	}
+	if cur := read(seed.CgroupPath, "memory.current"); cur == "0" {
+		t.Errorf("the seed cgroup is charged no memory: the template did not boot inside it")
+	}
+	t.Logf("seed cgroup: procs=%v memory.current=%s memory.peak=%s", procs, read(seed.CgroupPath, "memory.current"), read(seed.CgroupPath, "memory.peak"))
+
+	// A child lives in its own leaf and the seed's charge does not grow with it.
+	child, err := c.Fork(&forkd.ForkRequest{SeedID: "capped", ChildID: "k1", Env: []string{"CHILD_HOLD=1"}, Cgroup: limits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.CgroupPath == seed.CgroupPath || filepath.Dir(child.CgroupPath) != d.parent {
+		t.Errorf("child cgroup %q should be a sibling of the seed's %q", child.CgroupPath, seed.CgroupPath)
+	}
+	if cp := read(child.CgroupPath, "cgroup.procs"); strings.Contains(read(seed.CgroupPath, "cgroup.procs"), cp) {
+		t.Errorf("child process %s is also in the seed cgroup", cp)
+	}
+	// What the guest sees as memory is the seed's memory.max.
+	waitFile(t, child.StdoutPath, "READY")
+	if err := c.DeleteSeed("capped"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(seed.CgroupPath); !os.IsNotExist(err) {
+		t.Errorf("the seed's cgroup remains after the seed is deleted: %v", err)
+	}
+	if _, err := os.Stat(child.CgroupPath); !os.IsNotExist(err) {
+		t.Errorf("the child's cgroup remains after the seed is deleted: %v", err)
+	}
+
+	// A cap below what the template needs to boot kills it: the limit is real.
+	if _, err := c.Seed(req("tiny", &forkd.Cgroup{MemoryMax: 6 << 20})); err == nil {
+		t.Errorf("a seed with memory.max=6M booted")
+	} else {
+		t.Logf("seed with memory.max=6M: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(d.parent, "_seed.tiny")); !os.IsNotExist(err) {
+		t.Errorf("the failed seed's cgroup remains: %v", err)
+	}
+	if seeds, _, _ := c.List(); len(seeds) != 0 {
+		t.Errorf("forkd still lists seeds after both are gone: %+v", seeds)
+	}
+}
+
 func TestForkdLimitsAreEnforced(t *testing.T) {
 	needsHost(t)
 	d := startForkd(t)
@@ -469,9 +559,12 @@ func TestForkdLimitsAreEnforced(t *testing.T) {
 	seedBusybox(t, c, "bb")
 
 	// Memory: 200 MB of tmpfs pages under a 96 MB memory.max kill the child; with
-	// a 512 MB limit the same child finishes. The case has no memory.high: a child
-	// above memory.high is throttled, not killed, and stays alive for ages. That
-	// needs the stuck-child guard of the worker (Substrate memlimit.go), not forkd.
+	// a 512 MB limit the same child finishes. A child above memory.high is only
+	// throttled and stays alive for ages, so forkd refuses a limit with no
+	// memory_max (protocol 2) and the kernel's OOM kill is the only memory limit.
+	if _, err := c.Fork(&forkd.ForkRequest{SeedID: "bb", ChildID: "throttle", Cgroup: &forkd.Cgroup{PidsMax: 64, MemoryHigh: 96 << 20}}); err == nil || !strings.Contains(err.Error(), forkd.CodeInvalidArgument) {
+		t.Errorf("Fork with memory_high and no memory_max = %v, want invalid_argument", err)
+	}
 	small := &forkd.Cgroup{PidsMax: 64, MemoryMax: 96 << 20}
 	if _, err := c.Fork(&forkd.ForkRequest{SeedID: "bb", ChildID: "oom", Env: []string{"CHILD_ALLOC_MB=200"}, Cgroup: small}); err != nil {
 		t.Fatal(err)
@@ -556,7 +649,7 @@ func TestForkdEngine(t *testing.T) {
 	if v := os.Getenv("FORKD_ENGINE_ENV"); v != "" {
 		env = strings.Split(v, ",")
 	}
-	seed, err := c.Seed(&forkd.SeedRequest{SeedID: "eng", Image: image, ImageSHA256: digest, Args: strings.Fields(os.Getenv("FORKD_ENGINE_ARGS")), Env: env, Cwd: "/"})
+	seed, err := c.Seed(&forkd.SeedRequest{SeedID: "eng", Image: image, ImageSHA256: digest, Args: strings.Fields(os.Getenv("FORKD_ENGINE_ARGS")), Env: env, Cwd: "/", Cgroup: &forkd.Cgroup{MemoryMax: 2 << 30}})
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
