@@ -36,6 +36,7 @@ OTHER_SIDECARS = {
     "//runsc/checkpointgofer:checkpointgofer_binary": "checkpointgofer",
     "//runsc/cmd/metricserver:runsc-metric-server": "runsc-metric-server",
     "//runsc/fdparking:fdparking_binary": "runsc-fd-parking",
+    "//runsc/forkd/main:forkd": "forkd",
     "//runsc/prewarmer:prewarmer_binary": "gvisor-sentry-prewarmer",
     "//runsc/procumounter:procumounter_binary": "gvisor-proc-umounter",
 }

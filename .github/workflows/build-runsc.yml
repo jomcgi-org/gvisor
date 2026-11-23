@@ -91,10 +91,21 @@ jobs:
           //runsc/container:template_fork_startup_benchmark_test \
           //runsc/container:template_fork_e2e_test \
           //runsc/container:template_fork_semgrep_net_test \
+          //runsc/forkd/main:forkd \
+          //runsc/forkd:forkd_test \
+          //runsc/forkd:forkd_integration_test \
           //test/cmd/forkbench \
           //test/cmd/fork_ready \
           //test/cmd/fork_state \
           //test/cmd/test_app
+
+    - name: Run the forkd unit tests
+      continue-on-error: true
+      run: |
+        # The unit tests use a fake runtime and need no KVM. The tests that need
+        # root, cgroups or KVM skip here and run on the KVM host.
+        unset ANDROID_HOME ANDROID_SDK_ROOT ANDROID_NDK_HOME ANDROID_NDK_ROOT ANDROID_NDK_LATEST_HOME
+        bazelisk test --disk_cache="$HOME/.cache/bazel-disk-u2404" --test_output=errors //runsc/forkd:forkd_test
 
     - name: Save Bazel disk cache
       if: always()
@@ -113,6 +124,10 @@ jobs:
         for t in container_test template_fork_startup_benchmark_test template_fork_e2e_test template_fork_semgrep_net_test; do
           tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_" "$t.runfiles" 2>/dev/null \
             || tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_"
+        done
+        for t in forkd_test forkd_integration_test; do
+          tar --dereference -C "$BB/runsc/forkd" -czf "out/$t.runfiles.tar.gz" "${t}_" "$t.runfiles" 2>/dev/null \
+            || tar --dereference -C "$BB/runsc/forkd" -czf "out/$t.runfiles.tar.gz" "${t}_"
         done
         tar -C out -czf out/runsc-release.tar.gz release
         for b in fork_ready fork_state test_app; do
