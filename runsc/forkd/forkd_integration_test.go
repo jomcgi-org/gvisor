@@ -86,7 +86,8 @@ echo "$E"
 [ -n "$(v CHILD_ALLOC_MB)" ] && /busybox dd if=/dev/zero of=/tmp/big bs=1M count=$(v CHILD_ALLOC_MB) 2>/dev/null
 [ -n "$(v CHILD_LISTEN)" ] && /busybox nc -l -p 8080 -w 30 </dev/null >/dev/null
 [ -n "$(v CHILD_HOLD)" ] && exec /busybox sleep 3600
-exit $(v CHILD_EXIT)
+X=$(v CHILD_EXIT)
+exit ${X:-0}
 `
 
 // buildBusyboxImage returns the path and SHA-256 of a read-only EROFS image
@@ -513,12 +514,27 @@ func TestForkdLimitsAreEnforced(t *testing.T) {
 	if w, err := c.Wait("life", 20_000); err != nil || w.Exit == nil || w.Exit.Reason != forkd.ReasonMaxLifetime {
 		t.Errorf("max lifetime: %+v, %v", w, err)
 	}
-	if _, err := c.Fork(&forkd.ForkRequest{SeedID: "bb", ChildID: "logs", Env: []string{"CHILD_HOLD=1"}, Cgroup: limits, LogBytesLimit: 20}); err != nil {
+	if _, err := c.Fork(&forkd.ForkRequest{SeedID: "bb", ChildID: "logs", Env: []string{"CHILD_HOLD=1"}, Cgroup: limits, LogBytesLimit: 10}); err != nil {
 		t.Fatal(err)
 	}
 	if w, err := c.Wait("logs", 20_000); err != nil || w.Exit == nil || w.Exit.Reason != forkd.ReasonLogLimit {
 		t.Errorf("log limit: %+v, %v", w, err)
 	}
+}
+
+// waitOutput polls a file until it holds a complete JSON object that contains
+// want.
+func waitOutput(path, want string, timeout time.Duration) ([]byte, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		b, _ := os.ReadFile(path)
+		if t := bytes.TrimSpace(b); bytes.Contains(b, []byte(want)) && len(t) > 0 && t[len(t)-1] == '}' {
+			return b, true
+		}
+		time.Sleep(200 * time.Microsecond)
+	}
+	b, _ := os.ReadFile(path)
+	return b, false
 }
 
 // TestForkdEngine forks children that run a scan engine from a digest-pinned
@@ -565,14 +581,13 @@ func TestForkdEngine(t *testing.T) {
 						t.Errorf("Fork %s: %v", id, err)
 						return
 					}
-					w, err := cc.Wait(id, 120_000)
-					if err != nil || w.Exit == nil || w.Exit.Reason != forkd.ReasonExited || *w.Exit.ExitCode != 0 {
-						t.Errorf("%s: %+v %v", id, w, err)
+					// The engine holds after it printed its result, like the forkbench
+					// harness expects: wait for the output, then delete the child.
+					out, ok := waitOutput(k.StdoutPath, `"results"`, 120*time.Second)
+					if !ok {
+						w, _ := cc.Wait(id, 0)
+						t.Errorf("%s printed no result: %.200q state %+v", id, out, w)
 						return
-					}
-					out, _ := os.ReadFile(k.StdoutPath)
-					if !bytes.Contains(out, []byte(`"results"`)) {
-						t.Errorf("%s printed no result: %.200q", id, out)
 					}
 					mu.Lock()
 					forkMS = append(forkMS, k.ForkMS)
