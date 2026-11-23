@@ -159,8 +159,12 @@ func startForkd(t *testing.T, args ...string) *daemon {
 	if err := d.cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- d.cmd.Wait() }()
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = d.cmd.Wait()
+		close(done)
+	}()
 	t.Cleanup(func() {
 		d.cmd.Process.Signal(unix.SIGTERM)
 		select {
@@ -174,8 +178,8 @@ func startForkd(t *testing.T, args ...string) *daemon {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		select {
-		case err := <-done:
-			t.Fatalf("forkd exited: %v\n%s", err, d.stderr.String())
+		case <-done:
+			t.Fatalf("forkd exited: %v\n%s", waitErr, d.stderr.String())
 		default:
 		}
 		if _, err := os.Stat(d.sock); err == nil {

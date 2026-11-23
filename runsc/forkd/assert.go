@@ -362,3 +362,17 @@ func attestChild(pid int) (lines []string, err error) {
 	}
 	return lines, nil
 }
+
+// DropForbiddenCapabilities removes the capabilities that forkd must not hand
+// to anything it starts from its bounding set. A process that starts as root
+// with the full set (a shell on a host) gets the same bounding set as a worker
+// pod that already dropped them, and the capabilities assertion then checks the
+// result. It needs CAP_SETPCAP.
+func DropForbiddenCapabilities() error {
+	for _, c := range []int{capSysModule, capSysRawio, capSysBoot, capSysTime, capMacAdmin, capMacOverride} {
+		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && err != unix.EINVAL {
+			return fmt.Errorf("dropping capability %d from the bounding set: %w", c, err)
+		}
+	}
+	return nil
+}

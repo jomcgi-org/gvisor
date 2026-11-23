@@ -137,6 +137,11 @@ func main() {
 		}
 		opt.AllowedUIDs = append(opt.AllowedUIDs, uint32(n))
 	}
+	// Children inherit the bounding set: drop what no sandbox needs before the
+	// startup assertions check it.
+	if err := forkd.DropForbiddenCapabilities(); err != nil {
+		die("%v", err)
+	}
 	srv, err := forkd.NewServer(opt, forkd.NewGVisorRuntime(conf))
 	if err != nil {
 		die("%v", err)
