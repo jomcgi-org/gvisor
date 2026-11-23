@@ -151,3 +151,22 @@ func TestUpdateMemoryFileFilestoreRejectsTemplateAlias(t *testing.T) {
 		t.Fatalf("template contents changed: %q", got)
 	}
 }
+
+func TestResetBootID(t *testing.T) {
+	k := &Kernel{}
+	first := k.BootID()
+	if first == "" {
+		t.Fatal("BootID() returned an empty ID")
+	}
+	if again := k.BootID(); again != first {
+		t.Errorf("BootID() changed from %q to %q without a reset", first, again)
+	}
+	k.ResetBootID()
+	second := k.BootID()
+	if second == "" || second == first {
+		t.Errorf("BootID() after ResetBootID() = %q, want a new ID different from %q", second, first)
+	}
+	if again := k.BootID(); again != second {
+		t.Errorf("BootID() changed from %q to %q after the reset", second, again)
+	}
+}

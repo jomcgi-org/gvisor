@@ -1640,3 +1640,50 @@ func TestForkNetworkSelectors(t *testing.T) {
 		t.Errorf("Fork(NetNSPath missing) = %v, want an error naming the path", err)
 	}
 }
+
+// TestTemplateForkBootID checks that every forked child reports its own boot ID,
+// also when the template read it during its initialization. Applications use it
+// as a machine identity.
+func TestTemplateForkBootID(t *testing.T) {
+	spec := testutil.NewSpecWithArgs("/busybox", "sh", "-c",
+		"echo TEMPLATE_BOOT_ID=$(/busybox cat /proc/sys/kernel/random/boot_id); exec 3<>/proc/gvisor/checkpoint; echo 1 >&3; /busybox cat <&3 | /busybox grep -qx restore && /busybox echo READY && /busybox sleep 3600")
+	root, image, cleanup := setupEROFSBusybox(t)
+	t.Cleanup(cleanup)
+	spec.Root.Path = root
+	spec.Mounts = nil
+	spec.Annotations = map[string]string{
+		sentryapi.RootfsPrefix + "type":    erofs.Name,
+		sentryapi.RootfsPrefix + "source":  image,
+		sentryapi.RootfsPrefix + "overlay": config.NoOverlay.String(),
+	}
+	conf := templateForkConf(t)
+	tmpl, stdout := startTestTemplate(t, conf, spec, 1)
+	templateID := ""
+	for _, line := range strings.Split(readFileForLog(t, stdout), "\n") {
+		if id, ok := strings.CutPrefix(line, "TEMPLATE_BOOT_ID="); ok {
+			templateID = id
+		}
+	}
+	if templateID == "" {
+		t.Fatalf("template did not print its boot ID: %q", readFileForLog(t, stdout))
+	}
+	seen := map[string]string{templateID: "template"}
+	for _, name := range []string{"child A", "child B", "child C"} {
+		child := lifecycleFork(t, tmpl, conf, lifecycleForkArgs(t))
+		flags := append(conf.ToFlags(), "exec", child.ID, "/busybox", "cat", "/proc/sys/kernel/random/boot_id")
+		cmd := exec.Command(specutils.ExePath, flags...)
+		cmd.Stderr = os.Stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("runsc exec in %s: %v", name, err)
+		}
+		id := strings.TrimSpace(string(out))
+		if len(id) != 36 {
+			t.Fatalf("%s boot ID = %q, want a UUID", name, id)
+		}
+		if other, dup := seen[id]; dup {
+			t.Errorf("%s has the boot ID %q of the %s", name, id, other)
+		}
+		seen[id] = name
+	}
+}
