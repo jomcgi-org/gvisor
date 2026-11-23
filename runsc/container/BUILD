@@ -277,6 +277,7 @@ go_test(
         "container_testutil_test.go",
         "template_fork_e2e_main_test.go",
         "template_fork_e2e_test.go",
+        "template_fork_netns_e2e_test.go",
     ],
     data = [
         "//:release",

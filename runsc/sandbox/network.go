@@ -449,25 +449,78 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 		return fmt.Errorf("unknown XDP mode: %v", conf.XDP.Mode)
 	}
 
+	args, cleanup, err := linksAndRoutesFromNS(nsPath, conf, disableIPv6)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	args.IsRestore = isRestore
+	log.Debugf("Setting up network, config: %+v", args)
+	if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, &args, nil); err != nil {
+		return fmt.Errorf("creating links and routes: %w", err)
+	}
+
+	return nil
+}
+
+// ForkNetworkArgs scrapes the interfaces and routes of the net namespace at
+// nsPath, like the network setup of a normal sandbox, and returns the
+// arguments that configure a sandbox forked from a template with them. The
+// addresses are removed from the host interfaces, which stay in the namespace.
+// The caller owns the files in FilePayload and must close them once the
+// forked sandbox has started or failed to start.
+//
+// The namespace must not be the root network namespace. Only
+// --network=sandbox with the default XDP mode and without a network proxy is
+// supported, because the other modes need the sandbox boot process.
+func ForkNetworkArgs(conf *config.Config, nsPath string, disableIPv6 bool) (*sentryapi.CreateLinksAndRoutesArgs, error) {
+	if nsPath == "" {
+		return nil, fmt.Errorf("network namespace path must be provided")
+	}
+	if conf.Network != config.NetworkSandbox {
+		return nil, fmt.Errorf("a network namespace needs --network=sandbox (got %v)", conf.Network)
+	}
+	if conf.XDP.Mode != config.XDPModeOff {
+		return nil, fmt.Errorf("a network namespace for a forked sandbox needs the default XDP mode (got %v)", conf.XDP.Mode)
+	}
+	if conf.UseNetworkProxy() {
+		return nil, fmt.Errorf("a network namespace for a forked sandbox does not support the network proxy")
+	}
+	args, cleanup, err := linksAndRoutesFromNS(nsPath, conf, disableIPv6)
+	if err != nil {
+		return nil, err
+	}
+	cleanup()
+	return &args, nil
+}
+
+// linksAndRoutesFromNS joins the net namespace at nsPath, scrapes its
+// interfaces, removes their addresses from the host and returns the arguments
+// that create them in a sandbox, including the sockets for the links. The
+// returned cleanup function closes files that args refers to but that the
+// caller of linksAndRoutesFromNS must not hand over.
+func linksAndRoutesFromNS(nsPath string, conf *config.Config, disableIPv6 bool) (args sentryapi.CreateLinksAndRoutesArgs, cleanup func(), err error) {
+	noop := func() {}
 	// Join the network namespace that we will be copying.
 	restore, err := joinNetNS(nsPath)
 	if err != nil {
-		return err
+		return args, noop, err
 	}
 	defer restore()
 
 	isRoot, err := isRootNetNS()
 	if err != nil {
-		return err
+		return args, noop, err
 	}
 	if isRoot {
-		return fmt.Errorf("cannot run with network enabled in root network namespace")
+		return args, noop, fmt.Errorf("cannot run with network enabled in root network namespace")
 	}
 
 	// Collect addresses and routes from the interfaces.
-	args, err := collectLinksAndRoutes(conf, disableIPv6)
+	args, err = collectLinksAndRoutes(conf, disableIPv6)
 	if err != nil {
-		return err
+		return args, noop, err
 	}
 
 	var (
@@ -477,18 +530,34 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	if conf.UseNetworkProxy() {
 		primaryIface, err = primaryInterface(&args)
 		if err != nil {
-			return fmt.Errorf("UDS enabled: %w", err)
+			return args, noop, fmt.Errorf("UDS enabled: %w", err)
 		}
 		udsFile, err = dialExternalUDS(conf.NetworkProxyPath)
 		if err != nil {
-			return fmt.Errorf("dialing external UDS: %w", err)
+			return args, noop, fmt.Errorf("dialing external UDS: %w", err)
 		}
-		defer udsFile.Close()
+		cleanup = func() { udsFile.Close() }
+	} else {
+		cleanup = noop
 	}
+	// Do not leave a socket open if a later step fails.
+	succeeded := false
+	defer func() {
+		if succeeded {
+			return
+		}
+		if udsFile != nil {
+			udsFile.Close()
+		}
+		for _, f := range args.FilePayload.Files {
+			f.Close()
+		}
+		args.FilePayload.Files = nil
+	}()
 
 	for i := range args.XDPLinks {
 		if err := removeLinkAddresses(args.XDPLinks[i].Name, args.XDPLinks[i].Addresses); err != nil {
-			return fmt.Errorf("removing link addresses for interface %q: %w", args.XDPLinks[i].Name, err)
+			return args, noop, fmt.Errorf("removing link addresses for interface %q: %w", args.XDPLinks[i].Name, err)
 		}
 	}
 	for i := range args.FDBasedLinks {
@@ -498,7 +567,7 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 			continue
 		}
 		if err := removeLinkAddresses(args.FDBasedLinks[i].Name, args.FDBasedLinks[i].Addresses); err != nil {
-			return fmt.Errorf("removing link addresses for interface %q: %w", args.FDBasedLinks[i].Name, err)
+			return args, noop, fmt.Errorf("removing link addresses for interface %q: %w", args.FDBasedLinks[i].Name, err)
 		}
 	}
 
@@ -506,11 +575,11 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 		link := &args.XDPLinks[i]
 		iface, err := net.InterfaceByName(link.Name)
 		if err != nil {
-			return fmt.Errorf("getting interface by name %q: %w", link.Name, err)
+			return args, noop, fmt.Errorf("getting interface by name %q: %w", link.Name, err)
 		}
 		xdpSockFDs, err := createSocketXDP(*iface)
 		if err != nil {
-			return fmt.Errorf("failed to create XDP socket: %v", err)
+			return args, noop, fmt.Errorf("failed to create XDP socket: %v", err)
 		}
 		args.FilePayload.Files = append(args.FilePayload.Files, xdpSockFDs...)
 	}
@@ -523,11 +592,11 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 		} else {
 			iface, err := net.InterfaceByName(link.Name)
 			if err != nil {
-				return fmt.Errorf("getting interface by name %q: %w", link.Name, err)
+				return args, noop, fmt.Errorf("getting interface by name %q: %w", link.Name, err)
 			}
 			ifaceLink, err := netlink.LinkByName(link.Name)
 			if err != nil {
-				return fmt.Errorf("getting link for interface %q: %w", link.Name, err)
+				return args, noop, fmt.Errorf("getting link for interface %q: %w", link.Name, err)
 			}
 
 			log.Debugf("Setting up network channels")
@@ -536,13 +605,14 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 				log.Debugf("Creating Channel %d", j)
 				socketEntry, err := createSocket(*iface, ifaceLink, conf.HostGSO)
 				if err != nil {
-					return fmt.Errorf("failed to createSocket for %s : %w", link.Name, err)
+					return args, noop, fmt.Errorf("failed to createSocket for %s : %w", link.Name, err)
 				}
 				if j == 0 {
 					link.GSOMaxSize = socketEntry.gsoMaxSize
 				} else {
 					if link.GSOMaxSize != socketEntry.gsoMaxSize {
-						return fmt.Errorf("inconsistent gsoMaxSize %d and %d when creating multiple channels for same interface: %s",
+						socketEntry.deviceFile.Close()
+						return args, noop, fmt.Errorf("inconsistent gsoMaxSize %d and %d when creating multiple channels for same interface: %s",
 							link.GSOMaxSize, socketEntry.gsoMaxSize, link.Name)
 					}
 				}
@@ -558,16 +628,10 @@ func createInterfacesAndRoutesFromNS(conn *urpc.Client, nsPath string, conf *con
 	}
 
 	if err := pcapAndNAT(&args, conf); err != nil {
-		return err
+		return args, noop, err
 	}
-
-	args.IsRestore = isRestore
-	log.Debugf("Setting up network, config: %+v", args)
-	if err := conn.Call(sentryapi.ContMgrSetNetworkArgs, &args, nil); err != nil {
-		return fmt.Errorf("creating links and routes: %w", err)
-	}
-
-	return nil
+	succeeded = true
+	return args, cleanup, nil
 }
 
 // PluginStackPreInit prepares the plugin network stack for the sandbox process

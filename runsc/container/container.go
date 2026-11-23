@@ -312,7 +312,7 @@ type Args struct {
 //
 // Sandbox fork is experimental. It supports only single-container, goferless
 // EROFS templates on KVM or SlimVM. Templates use netstack with no configured
-// links, and NetworkArgs must be provided explicitly for every child. Exactly
+// links, and NetworkArgs or NetNSPath must be provided for every child. Exactly
 // the guest must request a checkpoint through /proc/gvisor/checkpoint. The template
 // workload must not create network endpoints before that read because their
 // state would be inherited by every forked child. Terminal stdio and metric
@@ -357,9 +357,26 @@ type ForkArgs struct {
 	Stdout *os.File
 	Stderr *os.File
 
-	// NetworkArgs configures the forked sandbox netstack. It must be provided;
-	// fork does not profile or configure host network state.
+	// NetworkArgs configures the forked sandbox netstack. Exactly one of
+	// NetworkArgs and NetNSPath must be provided.
 	NetworkArgs *sentryapi.CreateLinksAndRoutesArgs
+
+	// NetNSPath, if non-empty, is the path of an existing network namespace
+	// that becomes the network of the forked sandbox, so that its caller can
+	// join the child to a per-child network created outside the sandbox. Fork
+	// treats it like the network setup of a normal sandbox: it scrapes the
+	// links, addresses and routes of the namespace, removes the addresses from
+	// the host interfaces, opens a raw socket per link in the namespace, and
+	// gives the result to the child. The namespace must not be the root
+	// network namespace, and the config must use --network=sandbox. The
+	// caller needs CAP_SYS_ADMIN and CAP_NET_RAW over that namespace. The
+	// child itself does not join the namespace.
+	NetNSPath string
+
+	// DisableIPv6 drops IPv6 addresses and routes of the links found in
+	// NetNSPath, like the net.ipv6.conf.all.disable_ipv6 sysctl of a spec does
+	// for a normal sandbox. It has no effect without NetNSPath.
+	DisableIPv6 bool
 }
 
 // New creates the container in a new Sandbox process, unless the metadata
@@ -554,11 +571,25 @@ func (t *Template) Fork(conf *config.Config, args ForkArgs) (*Container, error) 
 	if err := validateID(t.ID); err != nil {
 		return nil, fmt.Errorf("invalid template id: %w", err)
 	}
-	if args.NetworkArgs == nil {
-		return nil, fmt.Errorf("forked sandbox requires explicit network arguments")
+	if (args.NetworkArgs == nil) == (args.NetNSPath == "") {
+		return nil, fmt.Errorf("forked sandbox requires exactly one of explicit network arguments and a network namespace path")
 	}
 	if err := validateTemplateForkConfig(conf, "forked sandbox"); err != nil {
 		return nil, err
+	}
+	if args.NetNSPath != "" {
+		// The sockets stay open in this process until the child has started or
+		// failed to start, and every caller of Fork may be long-lived.
+		networkArgs, err := sandbox.ForkNetworkArgs(conf, args.NetNSPath, args.DisableIPv6)
+		if err != nil {
+			return nil, fmt.Errorf("collecting network of namespace %q: %w", args.NetNSPath, err)
+		}
+		defer func() {
+			for _, f := range networkArgs.FilePayload.Files {
+				f.Close()
+			}
+		}()
+		args.NetworkArgs = networkArgs
 	}
 
 	if t.Platform != conf.Platform {

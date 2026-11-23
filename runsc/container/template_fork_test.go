@@ -1600,3 +1600,43 @@ func TestTemplateForkControlSurfaceBeforeStart(t *testing.T) {
 		t.Errorf("Processes after StartForked: %v", err)
 	}
 }
+
+// TestForkNetworkSelectors checks that Fork needs exactly one of NetworkArgs and
+// NetNSPath, and that a network namespace needs --network=sandbox, before it
+// touches any host network state.
+func TestForkNetworkSelectors(t *testing.T) {
+	conf := templateValidationConfig(t)
+	writeContainerStateForTemplateTest(t, conf.RootDir, "template", true, &TemplateState{
+		Ready:    true,
+		Platform: conf.Platform,
+	})
+	template, err := LoadTemplate(conf.RootDir, "template")
+	if err != nil {
+		t.Fatal(err)
+	}
+	both := ForkArgs{ID: "child", NetworkArgs: &sentryapi.CreateLinksAndRoutesArgs{}, NetNSPath: "/proc/self/ns/net"}
+	neither := ForkArgs{ID: "child"}
+	for name, args := range map[string]ForkArgs{"both": both, "neither": neither} {
+		_, err := template.Fork(conf, args)
+		if err == nil || !strings.Contains(err.Error(), "exactly one of explicit network arguments and a network namespace path") {
+			t.Errorf("Fork(%s) = %v, want the exactly-one error", name, err)
+		}
+	}
+
+	conf.Network = config.NetworkNone
+	_, err = template.Fork(conf, ForkArgs{ID: "child", NetNSPath: "/proc/self/ns/net"})
+	if err == nil || !strings.Contains(err.Error(), "needs --network=sandbox") {
+		t.Errorf("Fork(NetNSPath, --network=none) = %v, want a --network=sandbox error", err)
+	}
+	conf.Network = config.NetworkSandbox
+	conf.XDP.Mode = config.XDPModeTunnel
+	_, err = template.Fork(conf, ForkArgs{ID: "child", NetNSPath: "/proc/self/ns/net"})
+	if err == nil || !strings.Contains(err.Error(), "default XDP mode") {
+		t.Errorf("Fork(NetNSPath, XDP tunnel) = %v, want an XDP mode error", err)
+	}
+	conf.XDP.Mode = config.XDPModeOff
+	_, err = template.Fork(conf, ForkArgs{ID: "child", NetNSPath: "/nonexistent/netns"})
+	if err == nil || !strings.Contains(err.Error(), "/nonexistent/netns") {
+		t.Errorf("Fork(NetNSPath missing) = %v, want an error naming the path", err)
+	}
+}
