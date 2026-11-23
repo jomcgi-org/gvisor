@@ -35,7 +35,7 @@ jobs:
         # must ship ld.gold (ubuntu-24.04 does; the newer ubuntu-latest image does not).
         sudo apt-get update -qq
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-          build-essential crossbuild-essential-amd64 clang pkg-config libffi-dev \
+          build-essential crossbuild-essential-amd64 crossbuild-essential-arm64 clang pkg-config libffi-dev \
           libssl-dev patch zip unzip erofs-utils busybox-static
 
     - name: Bazelisk
