@@ -467,9 +467,11 @@ func TestForkdLimitsAreEnforced(t *testing.T) {
 	c := d.dial()
 	seedBusybox(t, c, "bb")
 
-	// Memory: 200 MB of tmpfs pages under a 96 MB limit kill the child; with a
-	// 512 MB limit the same child finishes.
-	small := &forkd.Cgroup{PidsMax: 64, MemoryHigh: 64 << 20, MemoryMax: 96 << 20}
+	// Memory: 200 MB of tmpfs pages under a 96 MB memory.max kill the child; with
+	// a 512 MB limit the same child finishes. The case has no memory.high: a child
+	// above memory.high is throttled, not killed, and stays alive for ages. That
+	// needs the stuck-child guard of the worker (Substrate memlimit.go), not forkd.
+	small := &forkd.Cgroup{PidsMax: 64, MemoryMax: 96 << 20}
 	if _, err := c.Fork(&forkd.ForkRequest{SeedID: "bb", ChildID: "oom", Env: []string{"CHILD_ALLOC_MB=200"}, Cgroup: small}); err != nil {
 		t.Fatal(err)
 	}
