@@ -208,9 +208,10 @@ func TestTemplateForkNetNSPath(t *testing.T) {
 	socketsBefore := socketFDCount(t)
 	const children = 2
 	var (
-		kids  []*Container
-		nets  []*forkTestNetNS
-		peers []string
+		kids    []*Container
+		nets    []*forkTestNetNS
+		peers   []string
+		childNS []string
 	)
 	for i := 0; i < children; i++ {
 		ns := newForkTestNetNS(t)
@@ -237,31 +238,34 @@ func TestTemplateForkNetNSPath(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Fork(NetNSPath) %d: %v", i, err)
 		}
+		// Read the child's namespace now: the guest exits as soon as it has
+		// reported ready, and its /proc entry goes with it.
+		link, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", child.SandboxPid()))
+		if err != nil {
+			t.Fatalf("child %d: %v", i, err)
+		}
+		childNS = append(childNS, link)
 		kids = append(kids, child)
 		nets = append(nets, ns)
 		peers = append(peers, peerName)
 		ready.waitFor(t, guestIP)
 	}
 
-	for i, child := range kids {
+	for i := range kids {
 		// The sandbox took the addresses over from the host interface.
 		if got := nets[i].addresses(t, peers[i]); len(got) != 0 {
 			t.Errorf("child %d: %s still has addresses %v in its namespace, want none", i, peers[i], got)
 		}
 		// The child runs in its own empty network namespace and has not
 		// joined the namespace it got its links from.
-		link, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", child.SandboxPid()))
-		if err != nil {
-			t.Fatal(err)
-		}
 		for j, ns := range nets {
-			if link == ns.id(t) {
-				t.Errorf("child %d runs in the host-side namespace of child %d (%s)", i, j, link)
+			if childNS[i] == ns.id(t) {
+				t.Errorf("child %d runs in the host-side namespace of child %d (%s)", i, j, childNS[i])
 			}
 		}
 	}
-	if kids[0].SandboxPid() == kids[1].SandboxPid() {
-		t.Error("both children have the same sandbox pid")
+	if childNS[0] == childNS[1] {
+		t.Errorf("both children run in the network namespace %s", childNS[0])
 	}
 
 	for _, child := range kids {
