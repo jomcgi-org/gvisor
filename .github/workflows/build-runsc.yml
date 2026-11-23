@@ -5,6 +5,7 @@ name: build-runsc (spike)
   push:
     branches:
       - spike/ci
+      - fork/seed-slice1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
