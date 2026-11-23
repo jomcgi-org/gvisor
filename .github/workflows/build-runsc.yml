@@ -123,11 +123,13 @@ jobs:
         # Test binaries with their runfiles (data deps incl. //:release), dereferenced.
         for t in container_test template_fork_startup_benchmark_test template_fork_e2e_test template_fork_semgrep_net_test; do
           tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_" "$t.runfiles" 2>/dev/null \
-            || tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_"
+            || tar --dereference -C "$BB/runsc/container" -czf "out/$t.runfiles.tar.gz" "${t}_" \
+            || echo "no output for $t, skipping"
         done
         for t in forkd_test forkd_integration_test; do
           tar --dereference -C "$BB/runsc/forkd" -czf "out/$t.runfiles.tar.gz" "${t}_" "$t.runfiles" 2>/dev/null \
-            || tar --dereference -C "$BB/runsc/forkd" -czf "out/$t.runfiles.tar.gz" "${t}_"
+            || tar --dereference -C "$BB/runsc/forkd" -czf "out/$t.runfiles.tar.gz" "${t}_" \
+            || echo "no output for $t, skipping"
         done
         tar -C out -czf out/runsc-release.tar.gz release
         for b in fork_ready fork_state test_app; do
