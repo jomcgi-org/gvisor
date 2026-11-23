@@ -917,6 +917,11 @@ func New(args Args) (*Loader, error) {
 		AllowSUID:           args.Conf.AllowSUID,
 		IOUringEnabled:      args.Conf.IOUring,
 	}
+	if args.TemplateSandbox {
+		// A template guest may create only AF_UNIX sockets until the fork
+		// checkpoint: every child inherits the endpoints it created.
+		l.k.SetUnixSocketsOnly(true)
+	}
 
 	// Create memory file.
 	mf, err := createMemoryFile(args.Conf.AppHugePages, args.HostTHP, args.TemplateSandbox)

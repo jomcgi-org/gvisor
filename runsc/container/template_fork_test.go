@@ -1687,3 +1687,38 @@ func TestTemplateForkBootID(t *testing.T) {
 		seen[id] = name
 	}
 }
+
+// TestTemplateRejectsNetworkEndpointsBeforeCheckpoint checks that the guest of a
+// template cannot create a network endpoint while it initializes, because every
+// child would inherit it, and that a forked child can.
+func TestTemplateRejectsNetworkEndpointsBeforeCheckpoint(t *testing.T) {
+	spec := testutil.NewSpecWithArgs("/busybox", "sh", "-c",
+		"/busybox nc -l -p 5555 -w 1 </dev/null 2>&1 | /busybox sed 's/^/PRE_NC: /'; "+
+			"/busybox echo TEMPLATE_INITIALIZED; exec 3<>/proc/gvisor/checkpoint; echo 1 >&3; "+
+			"/busybox cat <&3 | /busybox grep -qx restore && "+
+			"{ /busybox nc -l -p 5555 -w 1 </dev/null 2>&1 | /busybox sed 's/^/POST_NC: /'; /busybox echo READY; /busybox sleep 3600; }")
+	root, image, cleanup := setupEROFSBusybox(t)
+	t.Cleanup(cleanup)
+	spec.Root.Path = root
+	spec.Mounts = nil
+	spec.Annotations = map[string]string{
+		sentryapi.RootfsPrefix + "type":    erofs.Name,
+		sentryapi.RootfsPrefix + "source":  image,
+		sentryapi.RootfsPrefix + "overlay": config.NoOverlay.String(),
+	}
+	conf := templateForkConf(t)
+	tmpl, stdout := startTestTemplate(t, conf, spec, 1)
+	const refused = "Address family not supported"
+	if got := readFileForLog(t, stdout); !strings.Contains(got, "PRE_NC: ") || !strings.Contains(got, refused) {
+		t.Errorf("template creating an AF_INET socket before the checkpoint: output %q, want a %q error", got, refused)
+	}
+	args := lifecycleForkArgs(t)
+	lifecycleFork(t, tmpl, conf, args)
+	got := readFileForLog(t, args.Stdout.Name())
+	if strings.Contains(got, refused) {
+		t.Errorf("child creating an AF_INET socket: output %q, want no %q error", got, refused)
+	}
+	if !strings.Contains(got, "READY") {
+		t.Errorf("child output %q, want READY", got)
+	}
+}

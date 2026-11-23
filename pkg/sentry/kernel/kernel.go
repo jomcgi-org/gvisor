@@ -314,6 +314,14 @@ type Kernel struct {
 	// +checkatomic
 	uniqueID atomicbitops.Uint64
 
+	// unixSocketsOnly makes socket creation fail for every address family but
+	// AF_UNIX. A template sandbox sets it while its guest initializes, so that
+	// the guest cannot create network endpoints that every sandbox forked from
+	// the template would inherit.
+	//
+	// +checkatomic
+	unixSocketsOnly atomicbitops.Bool `state:"nosave"`
+
 	bootIDMu sync.Mutex `state:"nosave"`
 	// bootID is generated on first use and saved across checkpoints.
 	//
@@ -1399,6 +1407,18 @@ func (k *Kernel) ResetBootID() {
 	k.bootIDMu.Lock()
 	defer k.bootIDMu.Unlock()
 	k.bootID = ""
+}
+
+// SetUnixSocketsOnly sets whether socket creation fails for every address
+// family but AF_UNIX.
+func (k *Kernel) SetUnixSocketsOnly(v bool) {
+	k.unixSocketsOnly.Store(v)
+}
+
+// UnixSocketsOnly returns whether socket creation fails for every address
+// family but AF_UNIX.
+func (k *Kernel) UnixSocketsOnly() bool {
+	return k.unixSocketsOnly.Load()
 }
 
 // UniqueID returns a unique identifier.

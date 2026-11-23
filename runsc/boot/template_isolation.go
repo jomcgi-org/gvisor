@@ -51,5 +51,8 @@ func resetInheritedForkState(l *Loader) error {
 		return fmt.Errorf("fork isolation: %w", err)
 	}
 	l.k.ResetBootID()
+	// The template cannot create endpoints other than AF_UNIX sockets while it
+	// initializes (see Loader.New). The child's guest can.
+	l.k.SetUnixSocketsOnly(false)
 	return nil
 }

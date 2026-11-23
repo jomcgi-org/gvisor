@@ -333,6 +333,9 @@ func RegisterProvider(family int, provider Provider) {
 
 // New creates a new socket with the given family, type and protocol.
 func New(t *kernel.Task, family int, stype linux.SockType, protocol int) (*vfs.FileDescription, *syserr.Error) {
+	if family != linux.AF_UNIX && t.Kernel().UnixSocketsOnly() {
+		return nil, syserr.ErrAddressFamilyNotSupported
+	}
 	for _, p := range families[family] {
 		s, err := p.Socket(t, stype, protocol)
 		if err != nil {
