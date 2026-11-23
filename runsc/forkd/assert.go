@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -390,10 +391,15 @@ func attestChild(pid int) (lines []string, err error) {
 // with the full set (a shell on a host) gets the same bounding set as a worker
 // pod that already dropped them, and the capabilities assertion then checks the
 // result. It needs CAP_SETPCAP.
+//
+// The bounding set belongs to a thread, not to the process. The drop must reach
+// every thread of the Go runtime: a thread that keeps the full set would
+// hand it to a child that it clones, and the assertion reads the main thread.
 func DropForbiddenCapabilities() error {
 	for _, c := range []int{capSysModule, capSysRawio, capSysBoot, capSysTime, capMacAdmin, capMacOverride} {
-		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && err != unix.EINVAL {
-			return fmt.Errorf("dropping capability %d from the bounding set: %w", c, err)
+		_, _, errno := syscall.AllThreadsSyscall(syscall.SYS_PRCTL, uintptr(unix.PR_CAPBSET_DROP), uintptr(c), 0)
+		if errno != 0 && errno != unix.EINVAL {
+			return fmt.Errorf("dropping capability %d from the bounding set: %w", c, errno)
 		}
 	}
 	return nil

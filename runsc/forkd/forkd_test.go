@@ -22,7 +22,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -851,5 +853,52 @@ func TestVethPerChild(t *testing.T) {
 	_, err = e.client.Fork(&ForkRequest{SeedID: "s", ChildID: "n2", Net: &Net{NetNSPath: "/proc/1/ns/net", Veth: &Veth{HostCIDR: "198.18.77.1/30", GuestCIDR: "198.18.77.2/30"}}})
 	if codeOf(err) != CodeInvalidArgument {
 		t.Errorf("Fork with both netns_path and veth = %v, want invalid_argument", err)
+	}
+}
+
+// The bounding set is per thread. After DropForbiddenCapabilities no thread of
+// the process may keep a forbidden capability, however the goroutines moved.
+func TestDropForbiddenCapabilitiesReachesEveryThread(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	// Make threads: blocked goroutines each hold an OS thread.
+	var wg, started sync.WaitGroup
+	release := make(chan struct{})
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		started.Add(1)
+		go func() {
+			runtime.LockOSThread()
+			defer wg.Done()
+			started.Done()
+			<-release
+		}()
+	}
+	started.Wait()
+	defer func() { close(release); wg.Wait() }()
+	if err := DropForbiddenCapabilities(); err != nil {
+		t.Skipf("cannot drop capabilities: %v", err)
+	}
+	forbidden := capBit(capSysModule) | capBit(capSysRawio) | capBit(capSysBoot) | capBit(capSysTime) | capBit(capMacAdmin) | capBit(capMacOverride)
+	tasks, err := os.ReadDir("/proc/self/task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) < 16 {
+		t.Fatalf("only %d threads, the test needs many", len(tasks))
+	}
+	for _, task := range tasks {
+		data, err := os.ReadFile("/proc/self/task/" + task.Name() + "/status")
+		if err != nil {
+			continue // exited meanwhile
+		}
+		st, err := parseProcStatus(string(data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.CapBnd&forbidden != 0 {
+			t.Errorf("thread %s keeps %#x in its bounding set", task.Name(), st.CapBnd&forbidden)
+		}
 	}
 }
